@@ -1,8 +1,8 @@
 
 
-MYSQL_ADD_PLUGIN(threadpool_evented_io
-  threadpool_evented_io.cc
+MYSQL_ADD_PLUGIN(threadpool_epoll
+  threadpool_epoll.cc
   MODULE_ONLY
-  MODULE_OUTPUT_NAME "libthreadpool_evented_io"
+  MODULE_OUTPUT_NAME "libthreadpool_epoll"
   )
   
