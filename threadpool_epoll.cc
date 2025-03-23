@@ -1,19 +1,16 @@
-#include <ctype.h>
-#include <fcntl.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <time.h>
 #include <vector>
 #include <chrono>
-#include <climits>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 
+#include "my_psi_config.h"
+#include "sql/mysqld.h"
+
 #include "mysql/plugin.h"
 #include "my_thread.h"
-#include "sql/sql_plugin.h"  // st_plugin_int
 #include "sql/conn_handler/plugin_connection_handler.h"
 #include "sql/sql_thd_internal_api.h"
+
 
 static void* tp_thread_start(void *p);
 static MYSQL_PLUGIN threadpool_epoll_plugin;
@@ -62,7 +59,6 @@ struct Threadpool {
   atomic<size_t> threads_count;         /* total threads */
   atomic<size_t> threads_epoll_waiting; /* total threads waiting on epoll */
   atomic<size_t> threads_lock_waiting;  /* total threads waiting on a lock */
-  vector<chrono::steady_clock::time_point> ep_waiting_times; /* Start time N threads have been waiting */
 
   Threadpool(const Threadpool &);
   Threadpool();
@@ -92,43 +88,48 @@ struct TpEpClientEvent : public TpEpEvent {
   TpEpClientEvent(Threadpool &tp_in, THD *thd_in)
     : TpEpEvent(tp_in), thd(thd_in), do_handshake(true), in_lock_wait(false) {}
   
-  ~TpEpClientEvent() {
-    destroy_thd(thd);
-  }
+  ~TpEpClientEvent() {}
 
   void readd_to_epoll() {
     epoll_event evt;
     evt.events = EPOLLIN | EPOLLRDHUP | EPOLLET | EPOLLONESHOT;
     evt.data.ptr = this;
     if (epoll_ctl(tp.epfd, EPOLL_CTL_MOD, thd_get_fd(thd), &evt)) {
-      my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
-        "errno %d from epoll_ctl(...) in TpEpClientEvent::read_to_epoll()", errno);
+      exit(1);
+    }
+  }
+
+  void del_from_epoll() {
+    if (epoll_ctl(tp.epfd, EPOLL_CTL_DEL, thd_get_fd(thd), nullptr)) {
+      exit(1);
     }
   }
 
   bool process() override {
     char thread_top = 0;
-    mysql_socket_set_thread_owner(thd_get_mysql_socket(thd));
     if (do_handshake) {
       do_handshake = false;
-      thd_init(thd, &thread_top);
+      thd_init(thd, &thread_top, false, key_thread_one_connection, 0);
       if (!thd_prepare_connection(thd)) {
         // successfully processed. re-add to epoll
         readd_to_epoll();
         return false;
       }
+      increment_aborted_connects();
+      del_from_epoll();
     } else {
       thd_set_thread_stack(thd, &thread_top);
-      if (!do_command(thd)) {
+      thd_store_globals(thd);
+      if (thd_connection_alive(thd) && !do_command(thd)) {
         // successfully processed. re-add to epoll
         readd_to_epoll();
         return false;
       }
-
+      del_from_epoll();
       end_connection(thd);
     }
     close_connection(thd, 0, false, false);
-
+    destroy_thd(thd, true);
     delete this;
     dec_connection_count();
     return false;
@@ -150,16 +151,20 @@ struct TpEpShutdownEvent : public TpEpEvent {
   }
 };
 
-Threadpool::Threadpool(const Threadpool &) {}
 
-Threadpool::Threadpool() {}
+
+Threadpool::Threadpool(const Threadpool &) {
+}
+
+Threadpool::Threadpool() {
+}
 
 Threadpool& Threadpool::operator=(const Threadpool&) {
   return *this;
 }
 
 Threadpool::~Threadpool() {
-  teardown();
+  //teardown();
 }
 
 void Threadpool::maybe_spawn_thread() {
@@ -179,14 +184,16 @@ void Threadpool::maybe_spawn_thread() {
 }
 
 bool Threadpool::thread_should_die() {
-  // keeps us in the range of min_threads_epoll_waiting or min_threads_epoll_waiting + 1
+  // keeps us in the range of min_threads_epoll_waiting or 
+  // min_threads_epoll_waiting + 1
   size_t waiting;
   do {
     waiting = threads_epoll_waiting;
     if (waiting - 1 <= my_min_waiting_threads_per_pool) {
       return false;
     }
-  } while (threads_epoll_waiting.compare_exchange_weak(waiting, waiting - 1));
+  } while (threads_epoll_waiting.compare_exchange_weak(waiting, waiting - 1,
+                                                       memory_order_relaxed));
   return true;
 }
 
@@ -197,13 +204,19 @@ void Threadpool::thread_loop() {
     int cnt = epoll_wait(epfd, &evt, 1, -1);
     if (cnt == 0) {
       continue;
+    } else if (cnt == -1) {
+      if (errno == EINTR) {
+        continue;
+      } else {
+        exit(1);
+      }
     }
     maybe_spawn_thread();
     --threads_epoll_waiting;
 
     TpEpEvent *event = (TpEpEvent*)evt.data.ptr;
     if (event->process()) {
-      // thread shutdown
+      // server shutdown
       return;
     }
     ++threads_epoll_waiting;
@@ -236,7 +249,6 @@ int Threadpool::initialize() {
     my_thread_attr_destroy(&attr);
     if (res)
       return errno;
-    threads_count.wait(i + 1);
   }
   return 0;
 }
@@ -266,19 +278,19 @@ bool tp_ep_add_connection(Channel_info *channel_info) {
      next = next_threadpool.load(memory_order_relaxed);
      nextnext = next + 1;
      if (nextnext == threadpools.size()) nextnext = 0;
-  } while(!next_threadpool.compare_exchange_weak(next, nextnext, memory_order_relaxed));
+  } while(!next_threadpool.compare_exchange_weak(next, nextnext,
+                                                 memory_order_relaxed));
 
   Threadpool &tp = threadpools[next];
   THD *thd = create_thd(channel_info);
-  destroy_channel_info(channel_info);
   if (thd == nullptr) {
     increment_aborted_connects();
     Connection_handler_manager::dec_connection_count();
     return true;
   }
+  destroy_channel_info(channel_info);
 
   TpEpClientEvent *tp_ep_client_event = new TpEpClientEvent(tp, thd);
-
   thd_set_scheduler_data(thd, tp_ep_client_event);
   epoll_event evt;
   evt.events = EPOLLOUT | EPOLLONESHOT;
@@ -286,7 +298,6 @@ bool tp_ep_add_connection(Channel_info *channel_info) {
   if (epoll_ctl(tp.epfd, EPOLL_CTL_ADD, thd_get_fd(thd), &evt)) {
     my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
       "Error %d in tp_ep_add_connection", errno);
-    return true;
   }
 
   return false;
@@ -327,14 +338,12 @@ void tp_ep_thd_wait_begin(THD *thd, int wait_type) {
           my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
             "Error %d in tp_ep_thd_wait_begin()", errno);
         }
-        ++event->tp.threads_lock_waiting;
       }
       break;
     }
     default:
       break;
   }
-
 }
 
 void tp_ep_thd_wait_end(THD *thd) {
@@ -348,7 +357,7 @@ void tp_ep_thd_wait_end(THD *thd) {
   }
 }
 
-void tp_ep_post_kill_notification(THD */*thd*/) {
+void tp_ep_post_kill_notification(THD *thd [[maybe_unused]]) {
 
 }
 
@@ -388,7 +397,7 @@ static void* tp_thread_start(void *p) {
   return nullptr;
 }
 
-static int tp_ep_plugin_init(MYSQL_PLUGIN plugin_ref [[maybe_unused]]) {
+static int tp_ep_plugin_init(MYSQL_PLUGIN plugin_ref) {
   DBUG_TRACE;
   threadpool_epoll_plugin = plugin_ref;
   if (my_max_threads_per_pool < my_min_waiting_threads_per_pool) {
