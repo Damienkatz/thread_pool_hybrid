@@ -14,4 +14,4 @@ First, compile the plugin and install in to plugin dir
 
 Then, load the plugin into mysql
 
-    mysql> INSTALL PLUGIN THREADPOOL SONAME 'threadpool_epoll.so';
+    mysql> INSTALL PLUGIN THREADPOOL_EPOLL SONAME 'libthreadpool_epoll.so';
