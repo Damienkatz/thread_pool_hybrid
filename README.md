@@ -7,7 +7,7 @@ First, compile the plugin and install in to plugin dir
 
     cp -r . /path/to/mysql-src/plugin/threadpool_epoll
     cd /path/to/mysql-src
-    cmake . -DBUILD_CONFIG=mysql_release
+    cmake . -DBUILD_CONFIG=mysql_release -DFORCE_INSOURCE_BUILD=1
     cd plugin/threadpool_epoll
     make
     make install
