@@ -1,7 +1,9 @@
 #include <vector>
 #include <chrono>
+#include <csignal>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/sysinfo.h>
 
 #include "my_psi_config.h"
 #include "sql/mysqld.h"
@@ -15,39 +17,31 @@
 static void* tp_thread_start(void *p);
 static MYSQL_PLUGIN threadpool_epoll_plugin;
 
-static unsigned int my_total_threadpools = 1;
+static unsigned int my_total_threadpools = 0;
 static MYSQL_SYSVAR_UINT(
   threadpool_epoll_total_threadpools, my_total_threadpools,
   PLUGIN_VAR_READONLY | PLUGIN_VAR_OPCMDARG,
-  "Total EPOLL threadpools",
-  NULL, NULL, 1, 1, 0xFFFF, 0);
+  "Total EPOLL threadpools. Zero defaults to number cores available",
+  NULL, NULL, 0, 0, 0xFFFF, 0);
 
 static unsigned int my_max_threads_per_pool = 1;
 static MYSQL_SYSVAR_UINT(
   threadpool_epoll_max_threads_per_pool, my_max_threads_per_pool,
   PLUGIN_VAR_READONLY | PLUGIN_VAR_OPCMDARG,
   "Maximum threads per pool",
-  NULL, NULL, 2, 1, 0xFFFF, 0);
+  NULL, NULL, 8, 1, 0xFFFF, 0);
 
-static unsigned int my_min_waiting_threads_per_pool = 1;
+static unsigned int my_min_waiting_threads_per_pool = 2;
 static MYSQL_SYSVAR_UINT(
   threadpool_epoll_min_waiting_threads_per_pool, my_min_waiting_threads_per_pool,
   PLUGIN_VAR_READONLY | PLUGIN_VAR_OPCMDARG,
   "Minimum threads waiting for client io per pool",
-  NULL, NULL, 1, 1, 0xFFFF, 0);
-
-bool my_debug_messages = true;
-static MYSQL_SYSVAR_BOOL(
-  threadpool_epoll_debug_messages, my_debug_messages,
-  PLUGIN_VAR_OPCMDARG,
-  "debug messages of thread creation and destruction, etc",
-  NULL, NULL, 0);
+  NULL, NULL, 2, 1, 0xFFFF, 0);
 
 static SYS_VAR *threadpool_epoll_system_variables[] = {
     MYSQL_SYSVAR(threadpool_epoll_total_threadpools),
     MYSQL_SYSVAR(threadpool_epoll_max_threads_per_pool),
     MYSQL_SYSVAR(threadpool_epoll_min_waiting_threads_per_pool),
-    MYSQL_SYSVAR(threadpool_epoll_debug_messages),
     nullptr};
 
 using namespace std;
@@ -64,8 +58,6 @@ struct Threadpool {
   Threadpool();
   Threadpool& operator=(const Threadpool&);
   ~Threadpool();
-  void maybe_spawn_thread();
-  bool thread_should_die();
   void thread_loop();
   int initialize();
   void teardown();
@@ -167,62 +159,57 @@ Threadpool::~Threadpool() {
   //teardown();
 }
 
-void Threadpool::maybe_spawn_thread() {
-  if (threads_epoll_waiting <= my_min_waiting_threads_per_pool &&
-      threads_count < my_max_threads_per_pool) {
-    my_thread_handle thread;
-    my_thread_attr_t attr;
-    my_thread_attr_init(&attr);
-    my_thread_attr_setdetachstate(&attr, MY_THREAD_CREATE_DETACHED);
-    int res = my_thread_create(&thread, &attr, tp_thread_start, this);
-    my_thread_attr_destroy(&attr);
-    if (res) {
-      my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
-        "errno %d from my_thread_create(...) in Threadpool::maybe_spawn_thread()", errno);
-    }
-  }
-}
-
-bool Threadpool::thread_should_die() {
-  // keeps us in the range of min_threads_epoll_waiting or 
-  // min_threads_epoll_waiting + 1
-  size_t waiting;
-  do {
-    waiting = threads_epoll_waiting;
-    if (waiting - 1 <= my_min_waiting_threads_per_pool) {
-      return false;
-    }
-  } while (threads_epoll_waiting.compare_exchange_weak(waiting, waiting - 1,
-                                                       memory_order_relaxed));
-  return true;
-}
-
 void Threadpool::thread_loop() {
   epoll_event evt;
   ++threads_epoll_waiting;
   while (true) {
     int cnt = epoll_wait(epfd, &evt, 1, -1);
-    if (cnt == 0) {
-      continue;
-    } else if (cnt == -1) {
+    if (cnt == -1) {
       if (errno == EINTR) {
         continue;
       } else {
-        exit(1);
+        my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
+          "unexpected errno %d from epoll_wait. raising SIGABRT", errno);
+        std::raise(SIGABRT);
       }
     }
-    maybe_spawn_thread();
-    --threads_epoll_waiting;
+    assert(cnt == 1);
+    size_t waiting;
+    bool spawn_thread;
+    do {
+      spawn_thread = false;
+      waiting = threads_epoll_waiting;
+      if (waiting - 1 < my_min_waiting_threads_per_pool &&
+          threads_count < my_max_threads_per_pool) {
+        spawn_thread = true;
+      }
+    } while(!threads_epoll_waiting.compare_exchange_weak(waiting, waiting - 1,
+                                                         memory_order_relaxed));
+    if (spawn_thread) {
+      my_thread_handle thread;
+      my_thread_attr_t attr;
+      my_thread_attr_init(&attr);
+      my_thread_attr_setdetachstate(&attr, MY_THREAD_CREATE_DETACHED);
+      int res = my_thread_create(&thread, &attr, tp_thread_start, this);
+      my_thread_attr_destroy(&attr);
+      if (res) {
+        my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
+          "errno %d from spawn thread. raising SIGABRT", errno);
+        std::raise(SIGABRT);
+      }
+    }
 
-    TpEpEvent *event = (TpEpEvent*)evt.data.ptr;
-    if (event->process()) {
-      // server shutdown
-      return;
-    }
-    ++threads_epoll_waiting;
-    if (thread_should_die()) {
-      return;
-    }
+    if (((TpEpEvent*)evt.data.ptr)->process())
+      return; // server shutdown
+    
+    // keeps us in the range of min_threads_epoll_waiting or 
+    // min_threads_epoll_waiting + 1
+    do {
+      waiting = threads_epoll_waiting;
+      if (waiting + 1 >= my_min_waiting_threads_per_pool)
+        return; // thread should die
+    } while(!threads_epoll_waiting.compare_exchange_weak(waiting, waiting + 1,
+                                                         memory_order_relaxed));
   }
 }
 
@@ -254,13 +241,10 @@ int Threadpool::initialize() {
 }
 
 void Threadpool::teardown() {
-  size_t count = threads_count;
-  while(count) {
+  while(threads_count) {
     size_t val = 1;
     static_assert(sizeof(val) == 8);
     assert(write(evfd, &val, sizeof(val)) == 8);
-    threads_count.wait(count - 1);
-    count = threads_count;
   }
   epoll_ctl(epfd, EPOLL_CTL_DEL, evfd, NULL);
   if (evfd >= 0) close(evfd);
@@ -326,17 +310,20 @@ void tp_ep_thd_wait_begin(THD *thd, int wait_type) {
     case THD_WAIT_USER_LOCK:
     {
       TpEpClientEvent *event = (TpEpClientEvent*)thd_get_scheduler_data(thd);
-      if (event && ++event->tp.threads_lock_waiting == event->tp.threads_count) {
+      if (event) {
+        event->tp.threads_lock_waiting++;
         event->in_lock_wait = true;
-        my_thread_handle thread;
-        my_thread_attr_t attr;
-        my_thread_attr_init(&attr);
-        my_thread_attr_setdetachstate(&attr, MY_THREAD_CREATE_DETACHED);
-        int res = my_thread_create(&thread, &attr, tp_thread_start, &event->tp);
-        my_thread_attr_destroy(&attr);
-        if (res) {
-          my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
-            "Error %d in tp_ep_thd_wait_begin()", errno);
+        if (event->tp.threads_lock_waiting == event->tp.threads_count) {
+          my_thread_handle thread;
+          my_thread_attr_t attr;
+          my_thread_attr_init(&attr);
+          my_thread_attr_setdetachstate(&attr, MY_THREAD_CREATE_DETACHED);
+          int res = my_thread_create(&thread, &attr, tp_thread_start, &event->tp);
+          my_thread_attr_destroy(&attr);
+          if (res) {
+            my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
+              "Error %d in tp_ep_thd_wait_begin()", errno);
+          }
         }
       }
       break;
@@ -371,12 +358,6 @@ static void* tp_thread_start(void *p) {
   Threadpool &tp = *(Threadpool*)p;
   
   tp.threads_count.fetch_add(1, memory_order_relaxed);
-  tp.threads_count.notify_one();
-
-  if (my_debug_messages) {
-    my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
-      "Threadpool thread created");
-  }
 
   if (my_thread_init()) {
     my_thread_exit(nullptr);
@@ -385,13 +366,10 @@ static void* tp_thread_start(void *p) {
       "Threadpool thread failed in my_thread_init()");
     return nullptr;
   }
-  tp.thread_loop();
-  tp.threads_count.fetch_sub(1, memory_order_relaxed);
 
-  if (my_debug_messages) {
-    my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
-      "Threadpool thread dieing");
-  }
+  tp.thread_loop();
+
+  tp.threads_count.fetch_sub(1, memory_order_relaxed);
   my_thread_end();
   my_thread_exit(nullptr);
   return nullptr;
@@ -400,6 +378,11 @@ static void* tp_thread_start(void *p) {
 static int tp_ep_plugin_init(MYSQL_PLUGIN plugin_ref) {
   DBUG_TRACE;
   threadpool_epoll_plugin = plugin_ref;
+
+  if (my_total_threadpools == 0) {
+    my_total_threadpools = sysconf(_SC_NPROCESSORS_ONLN);
+  }
+
   if (my_max_threads_per_pool < my_min_waiting_threads_per_pool) {
     my_min_waiting_threads_per_pool = my_max_threads_per_pool;
   }
@@ -423,12 +406,6 @@ errhandle:
   return 1;
 }
 
-static int tp_ep_plugin_deinit(void */*p*/) {
-  DBUG_TRACE;
-
-  return 0;
-}
-
 struct st_mysql_daemon threadpool_epoll_plugin_daemom = {MYSQL_DAEMON_INTERFACE_VERSION};
 
 mysql_declare_plugin(threadpool_epoll) {
@@ -440,7 +417,7 @@ mysql_declare_plugin(threadpool_epoll) {
     PLUGIN_LICENSE_PROPRIETARY,
     tp_ep_plugin_init,    /* Plugin Init */
     nullptr,              /* Plugin Check uninstall */
-    tp_ep_plugin_deinit,  /* Plugin Deinit */
+    nullptr,              /* Plugin Deinit */
     0x0100,               /* 1.0 */
     nullptr,              /* status variables */
     threadpool_epoll_system_variables,              /* system variables */
