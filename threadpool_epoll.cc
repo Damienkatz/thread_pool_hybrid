@@ -5,13 +5,10 @@
 #include <sys/eventfd.h>
 #include <sys/sysinfo.h>
 
-#include "my_psi_config.h"
-#include "sql/mysqld.h"
-
 #include "mysql/plugin.h"
 #include "my_thread.h"
-#include "sql/conn_handler/plugin_connection_handler.h"
 #include "sql/sql_thd_internal_api.h"
+#include "mysql/thread_pool_priv.h"
 
 
 static void* tp_thread_start(void *p);
@@ -58,9 +55,9 @@ struct Threadpool {
   Threadpool();
   Threadpool& operator=(const Threadpool&);
   ~Threadpool();
-  void thread_loop();
   int initialize();
   void teardown();
+  void thread_loop();
 };
 
 struct TpEpEvent {
@@ -101,7 +98,7 @@ struct TpEpClientEvent : public TpEpEvent {
     char thread_top = 0;
     if (do_handshake) {
       do_handshake = false;
-      thd_init(thd, &thread_top, false, key_thread_one_connection, 0);
+      thd_init(thd, &thread_top);
       if (!thd_prepare_connection(thd)) {
         // successfully processed. re-add to epoll
         readd_to_epoll();
@@ -121,7 +118,8 @@ struct TpEpClientEvent : public TpEpEvent {
       end_connection(thd);
     }
     close_connection(thd, 0, false, false);
-    destroy_thd(thd, true);
+    remove_ssl_err_thread_state();
+    destroy_thd(thd, false);
     delete this;
     dec_connection_count();
     return false;
@@ -159,9 +157,48 @@ Threadpool::~Threadpool() {
   //teardown();
 }
 
+int Threadpool::initialize() {
+  if ((epfd = epoll_create(1)) == -1)
+    return errno;
+  
+  if ((evfd = eventfd(0, 0)) == -1)
+    return errno;
+  
+  TpEpShutdownEvent* tp_ep_shutdown_event = new TpEpShutdownEvent(*this);
+  epoll_event epev;
+  epev.events = EPOLLIN | EPOLLONESHOT;
+  epev.data.ptr = tp_ep_shutdown_event;
+  if (epoll_ctl(epfd, EPOLL_CTL_ADD, evfd, &epev) == -1)
+    return errno;
+
+  for (size_t i = 0; i < my_min_waiting_threads_per_pool; i++) {
+    my_thread_handle thread;
+    my_thread_attr_t attr;
+    my_thread_attr_init(&attr);
+    my_thread_attr_setdetachstate(&attr, MY_THREAD_CREATE_DETACHED);
+    int res = my_thread_create(&thread, &attr, tp_thread_start, this);
+    my_thread_attr_destroy(&attr);
+    if (res)
+      return errno;
+  }
+  return 0;
+}
+
+void Threadpool::teardown() {
+  while(threads_count) {
+    size_t val = 1;
+    static_assert(sizeof(val) == 8);
+    assert(write(evfd, &val, sizeof(val)) == 8);
+  }
+  epoll_ctl(epfd, EPOLL_CTL_DEL, evfd, NULL);
+  if (evfd >= 0) close(evfd);
+  if (epfd >= 0) close(epfd);
+}
+
+
 void Threadpool::thread_loop() {
   epoll_event evt;
-  ++threads_epoll_waiting;
+  threads_epoll_waiting.fetch_add(1, memory_order_relaxed);
   while (true) {
     int cnt = epoll_wait(epfd, &evt, 1, -1);
     if (cnt == -1) {
@@ -206,49 +243,30 @@ void Threadpool::thread_loop() {
     // min_threads_epoll_waiting + 1
     do {
       waiting = threads_epoll_waiting;
-      if (waiting + 1 >= my_min_waiting_threads_per_pool)
+      if (waiting > my_min_waiting_threads_per_pool)
         return; // thread should die
     } while(!threads_epoll_waiting.compare_exchange_weak(waiting, waiting + 1,
                                                          memory_order_relaxed));
   }
 }
 
-int Threadpool::initialize() {
-  if ((epfd = epoll_create(1)) == -1)
-    return errno;
-  
-  if ((evfd = eventfd(0, 0)) == -1)
-    return errno;
-  
-  TpEpShutdownEvent* tp_ep_shutdown_event = new TpEpShutdownEvent(*this);
-  epoll_event epev;
-  epev.events = EPOLLIN | EPOLLONESHOT;
-  epev.data.ptr = tp_ep_shutdown_event;
-  if (epoll_ctl(epfd, EPOLL_CTL_ADD, evfd, &epev) == -1)
-    return errno;
 
-  for (size_t i = 0; i < my_min_waiting_threads_per_pool; i++) {
-    my_thread_handle thread;
-    my_thread_attr_t attr;
-    my_thread_attr_init(&attr);
-    my_thread_attr_setdetachstate(&attr, MY_THREAD_CREATE_DETACHED);
-    int res = my_thread_create(&thread, &attr, tp_thread_start, this);
-    my_thread_attr_destroy(&attr);
-    if (res)
-      return errno;
-  }
-  return 0;
-}
+static void* tp_thread_start(void *p) {
+  Threadpool &tp = *(Threadpool*)p;
+  
+  tp.threads_count.fetch_add(1, memory_order_relaxed);
 
-void Threadpool::teardown() {
-  while(threads_count) {
-    size_t val = 1;
-    static_assert(sizeof(val) == 8);
-    assert(write(evfd, &val, sizeof(val)) == 8);
+  if (my_thread_init()) {
+    my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
+      "Threadpool thread failed in my_thread_init()");
+    return nullptr;
   }
-  epoll_ctl(epfd, EPOLL_CTL_DEL, evfd, NULL);
-  if (evfd >= 0) close(evfd);
-  if (epfd >= 0) close(epfd);
+
+  tp.thread_loop();
+
+  tp.threads_count.fetch_sub(1, memory_order_relaxed);
+  my_thread_end();
+  return nullptr;
 }
 
 static vector<Threadpool> threadpools;
@@ -311,9 +329,11 @@ void tp_ep_thd_wait_begin(THD *thd, int wait_type) {
     {
       TpEpClientEvent *event = (TpEpClientEvent*)thd_get_scheduler_data(thd);
       if (event) {
-        event->tp.threads_lock_waiting++;
+        event->tp.threads_lock_waiting.fetch_add(1, memory_order_relaxed);
         event->in_lock_wait = true;
         if (event->tp.threads_lock_waiting == event->tp.threads_count) {
+          // if all threads are waiting on locks, spawn another thread
+          // so we can process the connection(s) holding the lock(s)
           my_thread_handle thread;
           my_thread_attr_t attr;
           my_thread_attr_init(&attr);
@@ -340,7 +360,7 @@ void tp_ep_thd_wait_end(THD *thd) {
   TpEpClientEvent *event = (TpEpClientEvent*)thd_get_scheduler_data(thd);
   if (event && event->in_lock_wait) {
     event->in_lock_wait = false;
-    --event->tp.threads_lock_waiting;
+    event->tp.threads_lock_waiting.fetch_sub(1, memory_order_relaxed);
   }
 }
 
@@ -354,26 +374,6 @@ THD_event_functions tp_ep_thd_event = {
   tp_ep_post_kill_notification
 };
 
-static void* tp_thread_start(void *p) {
-  Threadpool &tp = *(Threadpool*)p;
-  
-  tp.threads_count.fetch_add(1, memory_order_relaxed);
-
-  if (my_thread_init()) {
-    my_thread_exit(nullptr);
-
-    my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
-      "Threadpool thread failed in my_thread_init()");
-    return nullptr;
-  }
-
-  tp.thread_loop();
-
-  tp.threads_count.fetch_sub(1, memory_order_relaxed);
-  my_thread_end();
-  my_thread_exit(nullptr);
-  return nullptr;
-}
 
 static int tp_ep_plugin_init(MYSQL_PLUGIN plugin_ref) {
   DBUG_TRACE;
