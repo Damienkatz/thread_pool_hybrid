@@ -6,6 +6,7 @@
 #include <sys/sysinfo.h>
 
 #include "mysql/plugin.h"
+#include "mysql.h"
 #include "my_thread.h"
 #include "sql/sql_thd_internal_api.h"
 #include "mysql/thread_pool_priv.h"
@@ -256,7 +257,7 @@ static void* tp_thread_start(void *p) {
   
   tp.threads_count.fetch_add(1, memory_order_relaxed);
 
-  if (my_thread_init()) {
+  if (mysql_thread_init()) {
     my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
       "Threadpool thread failed in my_thread_init()");
     return nullptr;
@@ -265,7 +266,7 @@ static void* tp_thread_start(void *p) {
   tp.thread_loop();
 
   tp.threads_count.fetch_sub(1, memory_order_relaxed);
-  my_thread_end();
+  mysql_thread_end();
   return nullptr;
 }
 
