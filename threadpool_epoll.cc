@@ -255,18 +255,18 @@ void Threadpool::thread_loop() {
 static void* tp_thread_start(void *p) {
   Threadpool &tp = *(Threadpool*)p;
   
-  tp.threads_count.fetch_add(1, memory_order_relaxed);
-
   if (mysql_thread_init()) {
     my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
       "Threadpool thread failed in my_thread_init()");
     return nullptr;
   }
+  tp.threads_count.fetch_add(1, memory_order_relaxed);
+
 
   tp.thread_loop();
 
   tp.threads_count.fetch_sub(1, memory_order_relaxed);
-  mysql_thread_end();
+
   return nullptr;
 }
 
