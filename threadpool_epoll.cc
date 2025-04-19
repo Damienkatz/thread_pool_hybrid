@@ -16,29 +16,29 @@ static MYSQL_PLUGIN threadpool_epoll_plugin;
 
 static unsigned int my_total_threadpools = 0;
 static MYSQL_SYSVAR_UINT(
-  threadpool_epoll_total_threadpools, my_total_threadpools,
+  total_threadpools, my_total_threadpools,
   PLUGIN_VAR_READONLY | PLUGIN_VAR_OPCMDARG,
   "Total EPOLL threadpools. Zero defaults to number cores available",
   NULL, NULL, 0, 0, 0xFFFF, 0);
 
 static unsigned int my_max_threads_per_pool = 1;
 static MYSQL_SYSVAR_UINT(
-  threadpool_epoll_max_threads_per_pool, my_max_threads_per_pool,
+  max_threads_per_pool, my_max_threads_per_pool,
   PLUGIN_VAR_READONLY | PLUGIN_VAR_OPCMDARG,
   "Maximum threads per pool",
   NULL, NULL, 8, 1, 0xFFFF, 0);
 
 static unsigned int my_min_waiting_threads_per_pool = 2;
 static MYSQL_SYSVAR_UINT(
-  threadpool_epoll_min_waiting_threads_per_pool, my_min_waiting_threads_per_pool,
+  min_waiting_threads_per_pool, my_min_waiting_threads_per_pool,
   PLUGIN_VAR_READONLY | PLUGIN_VAR_OPCMDARG,
   "Minimum threads waiting for client io per pool",
   NULL, NULL, 2, 1, 0xFFFF, 0);
 
 static SYS_VAR *threadpool_epoll_system_variables[] = {
-    MYSQL_SYSVAR(threadpool_epoll_total_threadpools),
-    MYSQL_SYSVAR(threadpool_epoll_max_threads_per_pool),
-    MYSQL_SYSVAR(threadpool_epoll_min_waiting_threads_per_pool),
+    MYSQL_SYSVAR(total_threadpools),
+    MYSQL_SYSVAR(max_threads_per_pool),
+    MYSQL_SYSVAR(min_waiting_threads_per_pool),
     nullptr};
 
 using namespace std;
