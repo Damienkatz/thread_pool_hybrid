@@ -81,7 +81,7 @@ struct TpEpClientEvent : public TpEpEvent {
 
   void readd_to_epoll() {
     epoll_event evt;
-    evt.events = EPOLLIN | EPOLLRDHUP | EPOLLET | EPOLLONESHOT;
+    evt.events = EPOLLIN | EPOLLRDHUP | EPOLLONESHOT;
     evt.data.ptr = this;
     if (epoll_ctl(tp.epfd, EPOLL_CTL_MOD, thd_get_fd(thd), &evt)) {
       exit(1);
