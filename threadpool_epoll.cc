@@ -81,7 +81,7 @@ struct TpEpClientEvent : public TpEpEvent {
 
   void readd_to_epoll() {
     epoll_event evt;
-    evt.events = EPOLLIN | EPOLLRDHUP | EPOLLONESHOT;
+    evt.events = EPOLLIN | EPOLLRDHUP | EPOLLET | EPOLLONESHOT;
     evt.data.ptr = this;
     if (epoll_ctl(tp.epfd, EPOLL_CTL_MOD, thd_get_fd(thd), &evt)) {
       exit(1);
@@ -295,7 +295,7 @@ bool tp_ep_add_connection(Channel_info *channel_info) {
   TpEpClientEvent *tp_ep_client_event = new TpEpClientEvent(tp, thd);
   thd_set_scheduler_data(thd, tp_ep_client_event);
   epoll_event evt;
-  evt.events = EPOLLOUT | EPOLLONESHOT;
+  evt.events = EPOLLOUT | EPOLLRDHUP | EPOLLET | EPOLLONESHOT;
   evt.data.ptr = tp_ep_client_event;
   if (epoll_ctl(tp.epfd, EPOLL_CTL_ADD, thd_get_fd(thd), &evt)) {
     my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
