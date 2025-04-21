@@ -43,20 +43,17 @@ static SYS_VAR *threadpool_epoll_system_variables[] = {
 
 using namespace std;
 
-struct Threadpool_state {
-  uint32_t count = 0;
-  uint32_t epoll_waiting = 0;
-  uint32_t lock_waiting = 0;
-};
-
 struct Threadpool {
-  int epfd = -1;
-  int evfd = -1;                        /* used to shutdown the threadpool */
-  //atomic<size_t> threads_count;         /* total threads */
-  //atomic<size_t> threads_epoll_waiting; /* total threads waiting on epoll */
-  //atomic<size_t> threads_lock_waiting;  /* total threads waiting on a lock */
+  int epfd = -1;                  /* epoll fd used by pool */
+  int evfd = -1;                  /* eventfd used to shutdown the threads */
 
-  atomic<Threadpool_state> tp_state;
+  struct Threads_state {
+    uint32_t count = 0;           /* total threads */
+    uint32_t epoll_waiting = 0;   /* total threads waiting on epoll */
+    uint32_t lock_waiting = 0;    /* total threads waiting on a lock */
+  };
+
+  atomic<Threads_state> threads_state;
 
   Threadpool(const Threadpool &);
   Threadpool();
@@ -67,37 +64,39 @@ struct Threadpool {
   void thread_loop();
 };
 
-struct TpEpEvent {
+struct Tp_ep_event {
   Threadpool &tp;
-  TpEpEvent(Threadpool &tp_in) : tp(tp_in) {}
+  Tp_ep_event(Threadpool &tp_in) : tp(tp_in) {}
   // This method processes events. If it returns true it means
   // the server is shutting down.
   virtual bool process() = 0;
-  virtual ~TpEpEvent() {}
+  virtual ~Tp_ep_event() {}
 };
 
-struct TpEpClientEvent : public TpEpEvent {
+struct Tp_ep_client_event : public Tp_ep_event {
   THD *thd;
   bool do_handshake;
   bool in_lock_wait;
 
-  TpEpClientEvent(Threadpool &tp_in, THD *thd_in)
-    : TpEpEvent(tp_in), thd(thd_in), do_handshake(true), in_lock_wait(false) {}
+  Tp_ep_client_event(Threadpool &tp_in, THD *thd_in)
+    : Tp_ep_event(tp_in), thd(thd_in), do_handshake(true), in_lock_wait(false) {}
   
-  ~TpEpClientEvent() {}
+  ~Tp_ep_client_event() {}
 
   void readd_to_epoll() {
     epoll_event evt;
     evt.events = EPOLLIN | EPOLLONESHOT;
     evt.data.ptr = this;
     if (epoll_ctl(tp.epfd, EPOLL_CTL_MOD, thd_get_fd(thd), &evt)) {
-      exit(1);
+      // this shouldn't happen
+      std::raise(SIGABRT);
     }
   }
 
   void del_from_epoll() {
     if (epoll_ctl(tp.epfd, EPOLL_CTL_DEL, thd_get_fd(thd), nullptr)) {
-      exit(1);
+      // this shouldn't happen
+      std::raise(SIGABRT);
     }
   }
 
@@ -133,8 +132,8 @@ struct TpEpClientEvent : public TpEpEvent {
   }
 };
 
-struct TpEpShutdownEvent : public TpEpEvent {
-  TpEpShutdownEvent(Threadpool &tp_in) : TpEpEvent(tp_in) {}
+struct Tp_ep_shutdown_event : public Tp_ep_event {
+  Tp_ep_shutdown_event(Threadpool &tp_in) : Tp_ep_event(tp_in) {}
 
   bool process() override {
     epoll_event evt;
@@ -142,7 +141,7 @@ struct TpEpShutdownEvent : public TpEpEvent {
     evt.data.ptr = this;
     if (epoll_ctl(tp.epfd, EPOLL_CTL_MOD, tp.evfd, &evt)) {
       my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
-        "errno %d from epoll_ctl(...) in TpEpShutdownEvent::process()", errno);
+        "errno %d from epoll_ctl(...) in Tp_ep_shutdown_event::process()", errno);
     }
     return true;
   }
@@ -161,7 +160,7 @@ Threadpool& Threadpool::operator=(const Threadpool&) {
 }
 
 Threadpool::~Threadpool() {
-  //teardown();
+  teardown();
 }
 
 int Threadpool::initialize() {
@@ -171,7 +170,7 @@ int Threadpool::initialize() {
   if ((evfd = eventfd(0, 0)) == -1)
     return errno;
   
-  TpEpShutdownEvent* tp_ep_shutdown_event = new TpEpShutdownEvent(*this);
+  Tp_ep_shutdown_event* tp_ep_shutdown_event = new Tp_ep_shutdown_event(*this);
   epoll_event epev;
   epev.events = EPOLLIN | EPOLLONESHOT;
   epev.data.ptr = tp_ep_shutdown_event;
@@ -192,7 +191,7 @@ int Threadpool::initialize() {
 }
 
 void Threadpool::teardown() {
-  while(tp_state.load().count) {
+  while (threads_state.load().count) {
     size_t val = 1;
     static_assert(sizeof(val) == 8);
     assert(write(evfd, &val, sizeof(val)) == 8);
@@ -205,13 +204,13 @@ void Threadpool::teardown() {
 
 void Threadpool::thread_loop() {
   epoll_event evt;
-  Threadpool_state state_old, state_new;
+  Threads_state state_old, state_new;
   do {
-    state_old = state_new = tp_state.load();
+    state_old = state_new = threads_state.load();
     state_new.epoll_waiting++;
     state_new.count++;
-  } while (!tp_state.compare_exchange_weak(state_old, state_new,
-                                           memory_order_relaxed));
+  } while (!threads_state.compare_exchange_weak(state_old, state_new,
+                                                memory_order_relaxed));
   while (true) {
     int cnt = epoll_wait(epfd, &evt, 1, -1);
     if (cnt == -1) {
@@ -227,14 +226,14 @@ void Threadpool::thread_loop() {
     bool spawn_thread;
     do {
       spawn_thread = false;
-      state_old = state_new = tp_state.load();
+      state_old = state_new = threads_state.load();
       state_new.epoll_waiting--;
       if (state_new.epoll_waiting < my_min_waiting_threads_per_pool &&
           state_new.count < my_max_threads_per_pool) {
         spawn_thread = true;
       }
-    } while(!tp_state.compare_exchange_weak(state_old, state_new,
-                                            memory_order_relaxed));
+    } while (!threads_state.compare_exchange_weak(state_old, state_new,
+                                                  memory_order_relaxed));
     if (spawn_thread) {
       my_thread_handle thread;
       my_thread_attr_t attr;
@@ -249,12 +248,12 @@ void Threadpool::thread_loop() {
       }
     }
 
-    if (((TpEpEvent*)evt.data.ptr)->process()) {
+    if (((Tp_ep_event*)evt.data.ptr)->process()) {
       do {
-        state_old = state_new = tp_state.load();
+        state_old = state_new = threads_state.load();
         state_new.count--;
-      } while(!tp_state.compare_exchange_weak(state_old, state_new,
-                                              memory_order_relaxed));
+      } while (!threads_state.compare_exchange_weak(state_old, state_new,
+                                                    memory_order_relaxed));
       return; // server shutdown
     }
     
@@ -262,7 +261,7 @@ void Threadpool::thread_loop() {
     // min_threads_epoll_waiting + 1
     bool thread_die;
     do {
-      state_old = state_new = tp_state.load();
+      state_old = state_new = threads_state.load();
       if (state_new.epoll_waiting + 1 > my_min_waiting_threads_per_pool) {
         // threads_epoll_waiting would become 2 or more than my_min_waiting_threads_per_pool.
         // So thread should die.
@@ -272,8 +271,8 @@ void Threadpool::thread_loop() {
         state_new.epoll_waiting++;
         thread_die = false;
       }
-    } while(!tp_state.compare_exchange_weak(state_old, state_new,
-                                            memory_order_relaxed));
+    } while (!threads_state.compare_exchange_weak(state_old, state_new,
+                                                  memory_order_relaxed));
     if (thread_die) return;
   }
 }
@@ -305,8 +304,8 @@ bool tp_ep_add_connection(Channel_info *channel_info) {
      next = next_threadpool.load(memory_order_relaxed);
      nextnext = next + 1;
      if (nextnext == threadpools.size()) nextnext = 0;
-  } while(!next_threadpool.compare_exchange_weak(next, nextnext,
-                                                 memory_order_relaxed));
+  } while (!next_threadpool.compare_exchange_weak(next, nextnext,
+                                                  memory_order_relaxed));
 
   Threadpool &tp = threadpools[next];
   THD *thd = create_thd(channel_info);
@@ -317,7 +316,7 @@ bool tp_ep_add_connection(Channel_info *channel_info) {
   }
   destroy_channel_info(channel_info);
 
-  TpEpClientEvent *tp_ep_client_event = new TpEpClientEvent(tp, thd);
+  Tp_ep_client_event *tp_ep_client_event = new Tp_ep_client_event(tp, thd);
   thd_set_scheduler_data(thd, tp_ep_client_event);
   epoll_event evt;
   evt.events = EPOLLOUT | EPOLLONESHOT;
@@ -352,21 +351,27 @@ void tp_ep_thd_wait_begin(THD *thd, int wait_type) {
     case THD_WAIT_TABLE_LOCK:
     case THD_WAIT_USER_LOCK:
     {
-      TpEpClientEvent *event = (TpEpClientEvent*)thd_get_scheduler_data(thd);
+      /*
+      This code prevents all possible client threadpool threads being stuck in
+      waiting for locks and therefore a client that can clear the lock(s) doesn't
+      have an available client thread to continue it's transaction, creating a
+      resource deadlock. So when the count of locked threads is the same as
+      threads count, create another thread so the holder(s) of the lock(s) has a
+      chance to continue its transaction and unstick the server.
+      */
+      Tp_ep_client_event *event = (Tp_ep_client_event*)thd_get_scheduler_data(thd);
       if (event) {
-        Threadpool_state state_old, state_new;
+        Threadpool &tp = event->tp;
+        event->in_lock_wait = true; // mark as waiting for lock
+        Threadpool::Threads_state state_old, state_new;
         bool launch_thread;
         do {
-          launch_thread = false;
-          state_old = state_new = event->tp.tp_state;
+          state_old = state_new = tp.threads_state;
           state_new.lock_waiting++;
-          if (state_new.count == state_new.lock_waiting) {
-            launch_thread = true;
-          }
-        } while (!event->tp.tp_state.compare_exchange_weak(state_old, state_new,
-                                                           memory_order_relaxed));
+          launch_thread = (state_new.count == state_new.lock_waiting);
+        } while (!tp.threads_state.compare_exchange_weak(state_old, state_new,
+                                                         memory_order_relaxed));
 
-        event->in_lock_wait = true;
         if (launch_thread) {
           // if all threads are waiting on locks, spawn another thread
           // so we can process the connection(s) holding the lock(s)
@@ -374,7 +379,7 @@ void tp_ep_thd_wait_begin(THD *thd, int wait_type) {
           my_thread_attr_t attr;
           my_thread_attr_init(&attr);
           my_thread_attr_setdetachstate(&attr, MY_THREAD_CREATE_DETACHED);
-          int res = my_thread_create(&thread, &attr, tp_thread_start, &event->tp);
+          int res = my_thread_create(&thread, &attr, tp_thread_start, &tp);
           my_thread_attr_destroy(&attr);
           if (res) {
             my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
@@ -393,16 +398,16 @@ void tp_ep_thd_wait_end(THD *thd) {
   if (!thd) {
     return;
   }
-  TpEpClientEvent *event = (TpEpClientEvent*)thd_get_scheduler_data(thd);
+  Tp_ep_client_event *event = (Tp_ep_client_event*)thd_get_scheduler_data(thd);
   if (event && event->in_lock_wait) {
+    Threadpool &tp = event->tp;
     event->in_lock_wait = false;
-    
-    Threadpool_state state_old, state_new;
+    Threadpool::Threads_state state_old, state_new;
     do {
-      state_old = state_new = event->tp.tp_state;
+      state_old = state_new = tp.threads_state;
       state_new.lock_waiting--;
-    } while (!event->tp.tp_state.compare_exchange_weak(state_old, state_new,
-                                                       memory_order_relaxed));
+    } while (!tp.threads_state.compare_exchange_weak(state_old, state_new,
+                                                     memory_order_relaxed));
   }
 }
 
