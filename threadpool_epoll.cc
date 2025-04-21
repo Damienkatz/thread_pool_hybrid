@@ -88,7 +88,7 @@ struct TpEpClientEvent : public TpEpEvent {
 
   void readd_to_epoll() {
     epoll_event evt;
-    evt.events = EPOLLIN | EPOLLRDHUP | EPOLLET | EPOLLONESHOT;
+    evt.events = EPOLLIN | EPOLLONESHOT;
     evt.data.ptr = this;
     if (epoll_ctl(tp.epfd, EPOLL_CTL_MOD, thd_get_fd(thd), &evt)) {
       exit(1);
@@ -205,12 +205,12 @@ void Threadpool::teardown() {
 
 void Threadpool::thread_loop() {
   epoll_event evt;
-  Threadpool_state stateold, statenew;
+  Threadpool_state state_old, state_new;
   do {
-    stateold = statenew = tp_state.load();
-    statenew.epoll_waiting++;
-    statenew.count++;
-  } while (!tp_state.compare_exchange_weak(stateold, statenew,
+    state_old = state_new = tp_state.load();
+    state_new.epoll_waiting++;
+    state_new.count++;
+  } while (!tp_state.compare_exchange_weak(state_old, state_new,
                                            memory_order_relaxed));
   while (true) {
     int cnt = epoll_wait(epfd, &evt, 1, -1);
@@ -227,13 +227,13 @@ void Threadpool::thread_loop() {
     bool spawn_thread;
     do {
       spawn_thread = false;
-      stateold = statenew = tp_state.load();
-      statenew.epoll_waiting--;
-      if (statenew.epoll_waiting < my_min_waiting_threads_per_pool &&
-          statenew.count < my_max_threads_per_pool) {
+      state_old = state_new = tp_state.load();
+      state_new.epoll_waiting--;
+      if (state_new.epoll_waiting < my_min_waiting_threads_per_pool &&
+          state_new.count < my_max_threads_per_pool) {
         spawn_thread = true;
       }
-    } while(!tp_state.compare_exchange_weak(stateold, statenew,
+    } while(!tp_state.compare_exchange_weak(state_old, state_new,
                                             memory_order_relaxed));
     if (spawn_thread) {
       my_thread_handle thread;
@@ -251,9 +251,9 @@ void Threadpool::thread_loop() {
 
     if (((TpEpEvent*)evt.data.ptr)->process()) {
       do {
-        stateold = statenew = tp_state.load();
-        statenew.count--;
-      } while(!tp_state.compare_exchange_weak(stateold, statenew,
+        state_old = state_new = tp_state.load();
+        state_new.count--;
+      } while(!tp_state.compare_exchange_weak(state_old, state_new,
                                               memory_order_relaxed));
       return; // server shutdown
     }
@@ -262,17 +262,17 @@ void Threadpool::thread_loop() {
     // min_threads_epoll_waiting + 1
     bool thread_die;
     do {
-      stateold = statenew = tp_state.load();
-      if (statenew.epoll_waiting + 1 > my_min_waiting_threads_per_pool) {
+      state_old = state_new = tp_state.load();
+      if (state_new.epoll_waiting + 1 > my_min_waiting_threads_per_pool) {
         // threads_epoll_waiting would become 2 or more than my_min_waiting_threads_per_pool.
         // So thread should die.
-        statenew.count--;
+        state_new.count--;
         thread_die = true;
       } else {
-        statenew.epoll_waiting++;
+        state_new.epoll_waiting++;
         thread_die = false;
       }
-    } while(!tp_state.compare_exchange_weak(stateold, statenew,
+    } while(!tp_state.compare_exchange_weak(state_old, state_new,
                                             memory_order_relaxed));
     if (thread_die) return;
   }
@@ -320,7 +320,7 @@ bool tp_ep_add_connection(Channel_info *channel_info) {
   TpEpClientEvent *tp_ep_client_event = new TpEpClientEvent(tp, thd);
   thd_set_scheduler_data(thd, tp_ep_client_event);
   epoll_event evt;
-  evt.events = EPOLLOUT | EPOLLRDHUP | EPOLLET | EPOLLONESHOT;
+  evt.events = EPOLLOUT | EPOLLONESHOT;
   evt.data.ptr = tp_ep_client_event;
   if (epoll_ctl(tp.epfd, EPOLL_CTL_ADD, thd_get_fd(thd), &evt)) {
     my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
@@ -354,17 +354,17 @@ void tp_ep_thd_wait_begin(THD *thd, int wait_type) {
     {
       TpEpClientEvent *event = (TpEpClientEvent*)thd_get_scheduler_data(thd);
       if (event) {
-        Threadpool_state statusold, statusnew;
+        Threadpool_state state_old, state_new;
         bool launch_thread;
         do {
           launch_thread = false;
-          statusold = statusnew = event->tp.tp_state;
-          statusnew.lock_waiting++;
-          if (statusnew.count == statusnew.lock_waiting) {
+          state_old = state_new = event->tp.tp_state;
+          state_new.lock_waiting++;
+          if (state_new.count == state_new.lock_waiting) {
             launch_thread = true;
           }
-        } while (event->tp.tp_state.compare_exchange_weak(statusold, statusnew,
-                                                         memory_order_relaxed));
+        } while (!event->tp.tp_state.compare_exchange_weak(state_old, state_new,
+                                                           memory_order_relaxed));
 
         event->in_lock_wait = true;
         if (launch_thread) {
@@ -397,12 +397,12 @@ void tp_ep_thd_wait_end(THD *thd) {
   if (event && event->in_lock_wait) {
     event->in_lock_wait = false;
     
-    Threadpool_state statusold, statusnew;
+    Threadpool_state state_old, state_new;
     do {
-      statusold = statusnew = event->tp.tp_state;
-      statusnew.lock_waiting--;
-    } while (event->tp.tp_state.compare_exchange_weak(statusold, statusnew,
-                                                     memory_order_relaxed));
+      state_old = state_new = event->tp.tp_state;
+      state_new.lock_waiting--;
+    } while (!event->tp.tp_state.compare_exchange_weak(state_old, state_new,
+                                                       memory_order_relaxed));
   }
 }
 
