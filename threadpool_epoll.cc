@@ -56,10 +56,15 @@ struct Threadpool {
 
   atomic<Threads_state> threads_state;
 
-  Threadpool(const Threadpool &);
   Threadpool();
-  Threadpool& operator=(const Threadpool&);
   ~Threadpool();
+
+  // do nothing copy constructor allows us to be contained in a vector;
+  Threadpool(const Threadpool &);
+
+  // do nothing assignment operator allows us to be contained in a vector;
+  Threadpool& operator=(const Threadpool&);
+
   int initialize();
   void teardown();
   int spawn_thread();
@@ -124,18 +129,20 @@ struct Tp_ep_client_event {
 };
 
 
-Threadpool::Threadpool(const Threadpool &) {
-}
 
 Threadpool::Threadpool() {
 }
 
-Threadpool& Threadpool::operator=(const Threadpool&) {
-  return *this;
-}
-
 Threadpool::~Threadpool() {
   teardown();
+}
+
+// a do-nothing copy constructor ia so we can embed inside aa vector
+Threadpool::Threadpool(const Threadpool &) {
+}
+// a do-nothing assignment operator ia so we can embed inside aa vector
+Threadpool& Threadpool::operator=(const Threadpool&) {
+  return *this;
 }
 
 int Threadpool::initialize() {
@@ -168,8 +175,7 @@ int Threadpool::initialize() {
 
 void Threadpool::teardown() {
   while (threads_state.load().count) {
-    long val = 1;
-    static_assert(sizeof(val) == 8);
+    uint64_t val = 1;
     if (write(evfd, &val, sizeof(val)) != 8) 
       std::raise(SIGABRT);
   }
@@ -216,6 +222,7 @@ void Threadpool::thread_loop() {
       do {
         state_old = state_new = threads_state.load();
         state_new.count--;
+        state_new.epoll_waiting--;
       } while (!threads_state.compare_exchange_weak(state_old, state_new,
                                                     memory_order_relaxed));
       return;
@@ -238,7 +245,8 @@ void Threadpool::thread_loop() {
       if (res) {
         my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
           "errno %d from spawn_thread. raising SIGABRT", errno);
-        
+        // couldn't spawn thread likely to to low resources. Decrement count
+        // since no thread was create
         do {
           state_old = state_new = threads_state.load();
           state_new.count--;
