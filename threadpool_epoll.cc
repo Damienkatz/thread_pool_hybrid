@@ -134,7 +134,7 @@ Threadpool::Threadpool() {
 }
 
 Threadpool::~Threadpool() {
-  teardown();
+  //teardown();
 }
 
 // a do-nothing copy constructor ia so we can embed inside aa vector
