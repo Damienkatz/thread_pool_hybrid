@@ -134,7 +134,9 @@ Threadpool::Threadpool() {
 }
 
 Threadpool::~Threadpool() {
-  //teardown();
+  epoll_ctl(epfd, EPOLL_CTL_DEL, evfd, NULL);
+  if (evfd >= 0) close(evfd);
+  if (epfd >= 0) close(epfd);
 }
 
 // a do-nothing copy constructor ia so we can embed inside aa vector
@@ -159,14 +161,20 @@ int Threadpool::initialize() {
     return errno;
 
   for (size_t i = 0; i < my_min_waiting_threads_per_pool; i++) {
-    Threads_state state_new = threads_state.load();
-    state_new.count++;
-    threads_state.store(state_new);
+    Threads_state state_old, state_new;
+    do {
+      state_old = state_new = threads_state.load();
+      state_new.count++;
+    } while (!threads_state.compare_exchange_weak(state_old, state_new,
+                                                  memory_order_relaxed));
     int res = spawn_thread();
     if (res) {
-      state_new = threads_state.load();
-      state_new.count--;
-      threads_state.store(state_new);
+      // thread not created, decrement count and return error
+      do {
+        state_old = state_new = threads_state.load();
+        state_new.count--;
+      } while (!threads_state.compare_exchange_weak(state_old, state_new,
+                                                    memory_order_relaxed));
       return res;
     }
   }
@@ -175,14 +183,21 @@ int Threadpool::initialize() {
 
 void Threadpool::teardown() {
   while (threads_state.load().count) {
+    if (threads_state.load().count == 1) {
+      // this might be our client thread doing the teardown. if so skip it.
+      THD *thd = thd_get_current_thd();
+      if (thd) {
+        Tp_ep_client_event *event = (Tp_ep_client_event*)thd_get_scheduler_data(thd);
+        if (event && &event->tp == this)
+          return;
+      }
+    }
     uint64_t val = 1;
     if (write(evfd, &val, sizeof(val)) != 8) 
       std::raise(SIGABRT);
   }
-  epoll_ctl(epfd, EPOLL_CTL_DEL, evfd, NULL);
-  if (evfd >= 0) close(evfd);
-  if (epfd >= 0) close(epfd);
 }
+
 
 int Threadpool::spawn_thread() {
   my_thread_handle thread;
@@ -214,7 +229,7 @@ void Threadpool::thread_loop() {
       }
     }
     if (evt.data.ptr == nullptr) {
-      // this is our server shutdown event, read eventfd, decrement count
+      // this is our server shutdown event, read the eventfd, decrement count
       // and quit thread
       uint64_t val;
       if (read(evfd, &val, sizeof(val)) != 8) 
@@ -279,21 +294,21 @@ void Threadpool::thread_loop() {
 
 
 static void* tp_thread_start(void *p) {
-  Threadpool &tp = *(Threadpool*)p;
+  Threadpool *tp = (Threadpool*)p;
 
   if (my_thread_init()) {
     my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
       "Threadpool thread failed in my_thread_init()");
     Threadpool::Threads_state state_old, state_new;
     do {
-      state_old = state_new = tp.threads_state;
+      state_old = state_new = tp->threads_state;
       state_new.count--;
-    } while (!tp.threads_state.compare_exchange_weak(state_old, state_new,
+    } while (!tp->threads_state.compare_exchange_weak(state_old, state_new,
                                                       memory_order_relaxed));
     return nullptr;
   }
 
-  tp.thread_loop();
+  tp->thread_loop();
 
   my_thread_end();
   return nullptr;
@@ -336,7 +351,7 @@ bool tp_ep_add_connection(Channel_info *channel_info) {
 }
 
 void tp_ep_end() {
-  threadpools.resize(0);
+  for (Threadpool &tp : threadpools) tp.teardown();
 }
 
 Connection_handler_functions tp_ep_conn_handler = {
@@ -464,6 +479,11 @@ errhandle:
   return 1;
 }
 
+static int tp_ep_plugin_deinit(MYSQL_PLUGIN plugin_ref) {
+  threadpools.resize(0);
+  return 0;
+}
+
 struct st_mysql_daemon threadpool_epoll_plugin_daemom = {MYSQL_DAEMON_INTERFACE_VERSION};
 
 mysql_declare_plugin(threadpool_epoll) {
@@ -475,7 +495,7 @@ mysql_declare_plugin(threadpool_epoll) {
     PLUGIN_LICENSE_PROPRIETARY,
     tp_ep_plugin_init,    /* Plugin Init */
     nullptr,              /* Plugin Check uninstall */
-    nullptr,              /* Plugin Deinit */
+    tp_ep_plugin_deinit,  /* Plugin Deinit */
     0x0100,               /* 1.0 */
     nullptr,              /* status variables */
     threadpool_epoll_system_variables,              /* system variables */
