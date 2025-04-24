@@ -280,7 +280,7 @@ void Threadpool::thread_loop() {
         my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
           "errno %d from spawn_thread.", errno);
         // couldn't spawn thread likely to to low resources. Decrement count
-        // since no thread was create
+        // since no thread was created
         do {
           state_old = state_new = threads_state.load();
           state_new.count--;
@@ -351,25 +351,10 @@ bool tp_ep_add_connection(Channel_info *channel_info) {
   return false;
 }
 
-static void close_all_thds(THD* thd, uint64 server_shutdown) {
-  if (server_shutdown || thd_get_current_thd() != thd) {
-    // we are shutting down or the current_thd != thd, close the thd
-    Tp_ep_client_event *event = (Tp_ep_client_event*)thd_get_scheduler_data(thd);
-    if (event) { // its one of ours
-      close_connection(thd, 0, server_shutdown, false);
-      destroy_thd(thd, false);
-      delete event;
-      dec_connection_count();
-    }
-  }
-}
-
 void tp_ep_end() {
   my_min_waiting_threads_per_pool = 0;
   // stop all threads
   for (Threadpool &tp : threadpools) tp.teardown();
-  // close all connections
-  do_for_all_thd(close_all_thds, false);
 }
 
 Connection_handler_functions tp_ep_conn_handler = {
@@ -455,8 +440,14 @@ void tp_ep_thd_wait_end(THD *thd) {
   }
 }
 
-void tp_ep_post_kill_notification(THD *thd [[maybe_unused]]) {
-
+void tp_ep_post_kill_notification(THD *thd) {
+  Tp_ep_client_event *event = (Tp_ep_client_event*)thd_get_scheduler_data(thd);
+  if (event) {
+    close_connection(thd, 0, false, false);
+    destroy_thd(thd, false);
+    delete event;
+    dec_connection_count();
+  }
 }
 
 THD_event_functions tp_ep_thd_event = {
@@ -501,10 +492,9 @@ static int tp_ep_plugin_deinit(MYSQL_PLUGIN plugin_ref [[maybe_unused]]) {
   my_min_waiting_threads_per_pool = 0;
   // stop all threads
   for (Threadpool &tp : threadpools) tp.teardown();
-  // close all connections
-  do_for_all_thd(close_all_thds, true);
   // free the thread pools
   threadpools.resize(0);
+  (void)my_connection_handler_reset();
   return 0;
 }
 
