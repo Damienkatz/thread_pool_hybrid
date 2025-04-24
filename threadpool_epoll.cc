@@ -229,11 +229,17 @@ void Threadpool::thread_loop() {
       }
     } while (!threads_state.compare_exchange_weak(state_old, state_new,
                                                   memory_order_relaxed));
-    if (thread_die) return;
+    if (thread_die)
+      return;
 
     int cnt = epoll_wait(epfd, &evt, 1, -1);
     if (cnt == -1) {
       if (errno == EINTR) {
+        do {
+          state_old = state_new = threads_state.load();
+          state_new.epoll_waiting--;
+        } while (!threads_state.compare_exchange_weak(state_old, state_new,
+                                                      memory_order_relaxed));
         continue;
       } else {
         my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
