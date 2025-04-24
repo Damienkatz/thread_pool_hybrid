@@ -351,17 +351,15 @@ bool tp_ep_add_connection(Channel_info *channel_info) {
   return false;
 }
 
-static void close_all_thds(THD* thd, uint64 flags [[maybe_unused]]) {
-  if (thd_connection_alive(thd)) {
-    close_connection(thd, 0, false, false);
-    if (thd_get_current_thd() != thd) {
-      // don't free the current thd, it will be freed in normal processing
-      Tp_ep_client_event *event = (Tp_ep_client_event*)thd_get_scheduler_data(thd);
-      if (event) {
-        destroy_thd(thd, false);
-        delete event;
-        dec_connection_count();
-      }
+static void close_all_thds(THD* thd, uint64 server_shutdown) {
+  if (server_shutdown || thd_get_current_thd() != thd) {
+    // we are shutting down or the current_thd != thd, close the thd
+    Tp_ep_client_event *event = (Tp_ep_client_event*)thd_get_scheduler_data(thd);
+    if (event) { // its one of ours
+      close_connection(thd, 0, server_shutdown, false);
+      destroy_thd(thd, false);
+      delete event;
+      dec_connection_count();
     }
   }
 }
@@ -371,7 +369,7 @@ void tp_ep_end() {
   // stop all threads
   for (Threadpool &tp : threadpools) tp.teardown();
   // close all connections
-  do_for_all_thd(close_all_thds, 0);
+  do_for_all_thd(close_all_thds, false);
 }
 
 Connection_handler_functions tp_ep_conn_handler = {
@@ -504,7 +502,7 @@ static int tp_ep_plugin_deinit(MYSQL_PLUGIN plugin_ref [[maybe_unused]]) {
   // stop all threads
   for (Threadpool &tp : threadpools) tp.teardown();
   // close all connections
-  do_for_all_thd(close_all_thds, 0);
+  do_for_all_thd(close_all_thds, true);
   // free the thread pools
   threadpools.resize(0);
   return 0;
