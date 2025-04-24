@@ -210,14 +210,27 @@ int Threadpool::spawn_thread() {
 }
 
 void Threadpool::thread_loop() {
-  epoll_event evt;
-  Threads_state state_old, state_new;
-  do {
-    state_old = state_new = threads_state.load();
-    state_new.epoll_waiting++;
-  } while (!threads_state.compare_exchange_weak(state_old, state_new,
-                                                memory_order_relaxed));
   while (true) {
+    epoll_event evt;
+    Threads_state state_old, state_new;
+    // keeps us in the range of min_threads_epoll_waiting or 
+    // min_threads_epoll_waiting + 1
+    bool thread_die;
+    do {
+      state_old = state_new = threads_state.load();
+      if (state_new.epoll_waiting + 1 > my_min_waiting_threads_per_pool) {
+        // threads_epoll_waiting would become 2 or more than my_min_waiting_threads_per_pool.
+        // So thread should die.
+        state_new.count--;
+        thread_die = true;
+      } else {
+        state_new.epoll_waiting++;
+        thread_die = false;
+      }
+    } while (!threads_state.compare_exchange_weak(state_old, state_new,
+                                                  memory_order_relaxed));
+    if (thread_die) return;
+
     int cnt = epoll_wait(epfd, &evt, 1, -1);
     if (cnt == -1) {
       if (errno == EINTR) {
@@ -259,7 +272,7 @@ void Threadpool::thread_loop() {
       int res = spawn_thread();
       if (res) {
         my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
-          "errno %d from spawn_thread. raising SIGABRT", errno);
+          "errno %d from spawn_thread.", errno);
         // couldn't spawn thread likely to to low resources. Decrement count
         // since no thread was create
         do {
@@ -271,24 +284,6 @@ void Threadpool::thread_loop() {
     }
 
     ((Tp_ep_client_event*)evt.data.ptr)->process();
-    
-    // keeps us in the range of min_threads_epoll_waiting or 
-    // min_threads_epoll_waiting + 1
-    bool thread_die;
-    do {
-      state_old = state_new = threads_state.load();
-      if (state_new.epoll_waiting + 1 > my_min_waiting_threads_per_pool) {
-        // threads_epoll_waiting would become 2 or more than my_min_waiting_threads_per_pool.
-        // So thread should die.
-        state_new.count--;
-        thread_die = true;
-      } else {
-        state_new.epoll_waiting++;
-        thread_die = false;
-      }
-    } while (!threads_state.compare_exchange_weak(state_old, state_new,
-                                                  memory_order_relaxed));
-    if (thread_die) return;
   }
 }
 
@@ -350,8 +345,27 @@ bool tp_ep_add_connection(Channel_info *channel_info) {
   return false;
 }
 
+static void close_all_thds(THD* thd, uint64 flags [[maybe_unused]]) {
+  if (thd_connection_alive(thd)) {
+    close_connection(thd, 0, false, false);
+    if (thd_get_current_thd() != thd) {
+      // don't free the current thd, it will be freed in normal processing
+      Tp_ep_client_event *event = (Tp_ep_client_event*)thd_get_scheduler_data(thd);
+      if (event) {
+        destroy_thd(thd, false);
+        delete event;
+        dec_connection_count();
+      }
+    }
+  }
+}
+
 void tp_ep_end() {
+  my_min_waiting_threads_per_pool = 0;
+  // stop all threads
   for (Threadpool &tp : threadpools) tp.teardown();
+  // close all connections
+  do_for_all_thd(close_all_thds, 0);
 }
 
 Connection_handler_functions tp_ep_conn_handler = {
@@ -479,7 +493,7 @@ errhandle:
   return 1;
 }
 
-static int tp_ep_plugin_deinit(MYSQL_PLUGIN plugin_ref) {
+static int tp_ep_plugin_deinit(MYSQL_PLUGIN plugin_ref [[maybe_unused]]) {
   threadpools.resize(0);
   return 0;
 }
