@@ -494,6 +494,12 @@ errhandle:
 }
 
 static int tp_ep_plugin_deinit(MYSQL_PLUGIN plugin_ref [[maybe_unused]]) {
+  my_min_waiting_threads_per_pool = 0;
+  // stop all threads
+  for (Threadpool &tp : threadpools) tp.teardown();
+  // close all connections
+  do_for_all_thd(close_all_thds, 0);
+  // free the thread pools
   threadpools.resize(0);
   return 0;
 }
