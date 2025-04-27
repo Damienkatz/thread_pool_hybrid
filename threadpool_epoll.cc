@@ -85,15 +85,17 @@ struct Tp_ep_client_event {
     evt.events = EPOLLIN | EPOLLONESHOT;
     evt.data.ptr = this;
     if (epoll_ctl(tp.epfd, EPOLL_CTL_MOD, thd_get_fd(thd), &evt)) {
-      // this shouldn't happen
-      std::raise(SIGABRT);
+      // normal when socketfd closed. clean up here
+      destroy_thd(thd, false);
+      delete this;
+      dec_connection_count();
     }
   }
 
   void del_from_epoll() {
     if (epoll_ctl(tp.epfd, EPOLL_CTL_DEL, thd_get_fd(thd), nullptr)) {
-      // this shouldn't happen
-      std::raise(SIGABRT);
+      // normal when fd closed. clean up code will free the
+      // Tp_ep_client_event
     }
   }
 
@@ -358,16 +360,15 @@ void tp_ep_end() {
 }
 
 Connection_handler_functions tp_ep_conn_handler = {
-  UINT_MAX32,
+  (uint)get_max_connections(),
   tp_ep_add_connection,
   tp_ep_end
 };
 
 
 void tp_ep_thd_wait_begin(THD *thd, int wait_type) {
-  if (!thd) {
-    return;
-  }
+  if (!thd) return;
+
   switch (wait_type) {
     case THD_WAIT_ROW_LOCK:
     case THD_WAIT_GLOBAL_LOCK:
@@ -424,9 +425,8 @@ void tp_ep_thd_wait_begin(THD *thd, int wait_type) {
 }
 
 void tp_ep_thd_wait_end(THD *thd) {
-  if (!thd) {
-    return;
-  }
+  if (!thd) return;
+
   Tp_ep_client_event *event = (Tp_ep_client_event*)thd_get_scheduler_data(thd);
   if (event && event->in_lock_wait) {
     Threadpool &tp = event->tp;
@@ -443,10 +443,7 @@ void tp_ep_thd_wait_end(THD *thd) {
 void tp_ep_post_kill_notification(THD *thd) {
   Tp_ep_client_event *event = (Tp_ep_client_event*)thd_get_scheduler_data(thd);
   if (event) {
-    close_connection(thd, 0, false, false);
-    destroy_thd(thd, false);
-    delete event;
-    dec_connection_count();
+    shutdown(thd_get_fd(thd), SHUT_RDWR);
   }
 }
 
