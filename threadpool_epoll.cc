@@ -118,34 +118,70 @@ struct Tp_ep_client_event {
       do_handshake = false;
       thd_init(thd, &thread_top);
       if (!thd_prepare_connection(thd)) {
-        if (tp.use_thread_per_conn()) goto use_thread_per_conn;
-        // successfully processed. using epoll
-        readd_to_epoll();
-        return;
+        if (tp.use_thread_per_conn()) {
+          // Successful handshake, we have enough threads available.
+          // go the use_thread_per_conn path
+          goto use_thread_per_conn;
+        } else {
+          // Successful handshake. not enough threads. use epoll
+          readd_to_epoll();
+          return;
+        }
       }
+      // failed handshake, error path.
       increment_aborted_connects();
       del_from_epoll();
     } else {
+      // we get here from epoll_wait having done the handshake previously, 
+      // and now to process a command,
       thd_set_thread_stack(thd, &thread_top);
       thd_store_globals(thd);
       goto do_command;
 use_thread_per_conn:
       {
+      // Here we wait for the descriptor to become read ready.
       pollfd pfd = {thd_get_fd(thd), POLLIN, 0};
-      int res = poll(&pfd, 1, 2000);
-      if (res == 0 && tp.use_thread_per_conn()) goto use_thread_per_conn;
-      if (res == -1 && errno == EINTR) goto use_thread_per_conn;
+      int res = poll(&pfd, 1, 1000);
+      if (res == 0) {
+        // timeout waiting for data.
+        if (tp.use_thread_per_conn()) {
+          // still enough threads for use_thread_per_conn
+          goto use_thread_per_conn;
+        } else {
+          // not enough threads, Use epoll
+          readd_to_epoll();
+          return;
+        }
+      }
+      if (res == -1) {
+        if (errno == EINTR) {
+          // interrupt error, wait on poll again.
+          goto use_thread_per_conn;
+        } else {
+          // don't know this error. abort
+          my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
+            "unexpected errno %d from poll. raising SIGABRT", errno);
+          std::raise(SIGABRT);
+        }
+      }
       }
 do_command:
       if (thd_connection_alive(thd) && !do_command(thd)) {
-        if (tp.use_thread_per_conn()) goto use_thread_per_conn;
-        // successfully processed. using epoll
-        readd_to_epoll();
-        return;
+        // successfully processed. 
+        if (tp.use_thread_per_conn()) {
+          // enough threads for use_thread_per_conn
+          goto use_thread_per_conn;
+        } else {
+          // not enough threads. using epoll
+          readd_to_epoll();
+          return;
+        }
       }
+      // this is the error/stop path
       del_from_epoll();
       end_connection(thd);
     }
+    // close the connection, destroy the thd, delete ourself
     close_connection(thd, 0, false, false);
     remove_ssl_err_thread_state();
     destroy_thd(thd, false);
