@@ -1,6 +1,7 @@
 #include <vector>
 #include <chrono>
 #include <csignal>
+#include <poll.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/sysinfo.h>
@@ -51,10 +52,12 @@ struct Threadpool {
     uint32_t count = 0;           /* total threads */
     uint32_t epoll_waiting = 0;   /* total threads waiting on epoll */
     uint32_t lock_waiting = 0;    /* total threads waiting on a lock */
-    uint32_t padding = 0;         /* Make Threads_state 16 bytes */
+    uint32_t connection_count = 0;/* total clients connected to this threadpool */
   };
 
   atomic<Threads_state> threads_state;
+
+  atomic<bool> shutdown;
 
   Threadpool();
   ~Threadpool();
@@ -66,9 +69,10 @@ struct Threadpool {
   Threadpool& operator=(const Threadpool&);
 
   int initialize();
-  void teardown();
+  void shutdown_threads();
   int spawn_thread();
   void thread_loop();
+  bool use_thread_per_conn();
 };
 
 struct Tp_ep_client_event {
@@ -79,6 +83,15 @@ struct Tp_ep_client_event {
 
   Tp_ep_client_event(Threadpool &tp_in, THD *thd_in)
     : tp(tp_in), thd(thd_in), do_handshake(true), in_lock_wait(false) {}
+
+  ~Tp_ep_client_event() {
+    Threadpool::Threads_state state_old, state_new;
+    do {
+      state_old = state_new = tp.threads_state.load();
+      state_new.connection_count--;
+    } while (!tp.threads_state.compare_exchange_weak(state_old, state_new,
+                                                     memory_order_relaxed));
+  }
 
   void readd_to_epoll() {
     epoll_event evt;
@@ -105,7 +118,8 @@ struct Tp_ep_client_event {
       do_handshake = false;
       thd_init(thd, &thread_top);
       if (!thd_prepare_connection(thd)) {
-        // successfully processed. re-add to epoll
+        if (tp.use_thread_per_conn()) goto use_thread_per_conn;
+        // successfully processed. using epoll
         readd_to_epoll();
         return;
       }
@@ -114,8 +128,18 @@ struct Tp_ep_client_event {
     } else {
       thd_set_thread_stack(thd, &thread_top);
       thd_store_globals(thd);
+      goto do_command;
+use_thread_per_conn:
+      {
+      pollfd pfd = {thd_get_fd(thd), POLLIN, 0};
+      int res = poll(&pfd, 1, 2000);
+      if (res == 0 && tp.use_thread_per_conn()) goto use_thread_per_conn;
+      if (res == -1 && errno == EINTR) goto use_thread_per_conn;
+      }
+do_command:
       if (thd_connection_alive(thd) && !do_command(thd)) {
-        // successfully processed. re-add to epoll
+        if (tp.use_thread_per_conn()) goto use_thread_per_conn;
+        // successfully processed. using epoll
         readd_to_epoll();
         return;
       }
@@ -132,7 +156,7 @@ struct Tp_ep_client_event {
 
 
 
-Threadpool::Threadpool() {
+Threadpool::Threadpool() : shutdown(false) {
 }
 
 Threadpool::~Threadpool() {
@@ -147,6 +171,13 @@ Threadpool::Threadpool(const Threadpool &) {
 // a do-nothing assignment operator ia so we can embed inside aa vector
 Threadpool& Threadpool::operator=(const Threadpool&) {
   return *this;
+}
+
+bool Threadpool::use_thread_per_conn() {
+  if (shutdown.load()) return false;
+  Threads_state state = threads_state.load();
+  return state.count < my_max_threads_per_pool ||
+          state.connection_count < my_max_threads_per_pool;
 }
 
 int Threadpool::initialize() {
@@ -183,7 +214,8 @@ int Threadpool::initialize() {
   return 0;
 }
 
-void Threadpool::teardown() {
+void Threadpool::shutdown_threads() {
+  shutdown.store(true);
   while (threads_state.load().count) {
     if (threads_state.load().count == 1) {
       // this might be our client thread doing the teardown. if so skip it.
@@ -199,7 +231,6 @@ void Threadpool::teardown() {
       std::raise(SIGABRT);
   }
 }
-
 
 int Threadpool::spawn_thread() {
   my_thread_handle thread;
@@ -220,7 +251,8 @@ void Threadpool::thread_loop() {
     bool thread_die;
     do {
       state_old = state_new = threads_state.load();
-      if (state_new.epoll_waiting + 1 > my_min_waiting_threads_per_pool) {
+      if (shutdown.load() ||
+          state_new.epoll_waiting + 1 > my_min_waiting_threads_per_pool) {
         // threads_epoll_waiting would become 2 or more than my_min_waiting_threads_per_pool.
         // So thread should die.
         state_new.count--;
@@ -267,7 +299,7 @@ void Threadpool::thread_loop() {
     do {
       state_old = state_new = threads_state.load();
       state_new.epoll_waiting--;
-      if (state_new.epoll_waiting < my_min_waiting_threads_per_pool &&
+      if (!shutdown.load() && state_new.epoll_waiting < my_min_waiting_threads_per_pool &&
           state_new.count < my_max_threads_per_pool) {
         bspawn_thread = true;
         state_new.count++;
@@ -310,6 +342,7 @@ static void* tp_thread_start(void *p) {
                                                       memory_order_relaxed));
     return nullptr;
   }
+  my_thread_self_setname("tp_ep_worker");
 
   tp->thread_loop();
 
@@ -335,11 +368,17 @@ bool tp_ep_add_connection(Channel_info *channel_info) {
   THD *thd = create_thd(channel_info);
   if (thd == nullptr) {
     increment_aborted_connects();
-    Connection_handler_manager::dec_connection_count();
+    dec_connection_count();
     return true;
   }
   destroy_channel_info(channel_info);
 
+  Threadpool::Threads_state state_old, state_new;
+  do {
+    state_old = state_new = tp.threads_state;
+    state_new.connection_count++; // decremented in dtor os Tp_ep_client_event
+  } while (!tp.threads_state.compare_exchange_weak(state_old, state_new,
+                                                    memory_order_relaxed));
   Tp_ep_client_event *tp_ep_client_event = new Tp_ep_client_event(tp, thd);
   thd_set_scheduler_data(thd, tp_ep_client_event);
   epoll_event evt;
@@ -348,15 +387,18 @@ bool tp_ep_add_connection(Channel_info *channel_info) {
   if (epoll_ctl(tp.epfd, EPOLL_CTL_ADD, thd_get_fd(thd), &evt)) {
     my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
       "Error %d in tp_ep_add_connection", errno);
+    destroy_thd(thd, false);
+    delete tp_ep_client_event;
+    dec_connection_count();
+    return true;
   }
 
   return false;
 }
 
 void tp_ep_end() {
-  my_min_waiting_threads_per_pool = 0;
   // stop all threads
-  for (Threadpool &tp : threadpools) tp.teardown();
+  for (Threadpool &tp : threadpools) tp.shutdown_threads();
 }
 
 Connection_handler_functions tp_ep_conn_handler = {
@@ -486,9 +528,8 @@ errhandle:
 }
 
 static int tp_ep_plugin_deinit(MYSQL_PLUGIN plugin_ref [[maybe_unused]]) {
-  my_min_waiting_threads_per_pool = 0;
   // stop all threads
-  for (Threadpool &tp : threadpools) tp.teardown();
+  for (Threadpool &tp : threadpools) tp.shutdown_threads();
   // free the thread pools
   threadpools.resize(0);
   (void)my_connection_handler_reset();
