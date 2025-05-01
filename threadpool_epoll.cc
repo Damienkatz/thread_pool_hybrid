@@ -97,14 +97,8 @@ struct Tp_ep_client_event {
   bool in_lock_wait;
 
   Tp_ep_client_event(Threadpool &tp_in, THD *thd_in)
-    : tp(tp_in), thd(thd_in), do_handshake(true), in_lock_wait(false) {
-      Threadpool::Threads_state state_old, state_new;
-      do {
-        state_old = state_new = tp.threads_state.load();
-        state_new.connection_count++; // decremented in dtor os Tp_ep_client_event
-      } while (!tp.threads_state.compare_exchange_weak(state_old, state_new,
-                                                       memory_order_relaxed));
-    }
+      : tp(tp_in), thd(thd_in), do_handshake(true), in_lock_wait(false) {
+  }
 
   ~Tp_ep_client_event() {
     Threadpool::Threads_state state_old, state_new;
@@ -123,8 +117,9 @@ struct Tp_ep_client_event {
     evt.events = EPOLLIN | EPOLLONESHOT;
     evt.data.ptr = this;
     if (epoll_ctl(tp.epfd, EPOLL_CTL_MOD, thd_get_fd(thd), &evt)) {
-      // normal when socketfd closed. clean up here
-      delete this;
+      my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
+        "unexpected errno %d from epoll_ctl(EPOLL_CTL_MOD,...). raising SIGABRT", errno);
+      std::raise(SIGABRT);
     }
   }
 
@@ -162,20 +157,10 @@ struct Tp_ep_client_event {
       goto do_command;
 use_thread_per_conn:
       {
-      // Here we wait for the descriptor to become read ready.
-      pollfd pfd = {thd_get_fd(thd), POLLIN, 0};
-      int res = poll(&pfd, 1, 1000);
-      if (res == 0) {
-        // timeout waiting for data.
-        if (tp.use_thread_per_conn()) {
-          // still enough threads for use_thread_per_conn
-          goto use_thread_per_conn;
-        } else {
-          // not enough threads, Use epoll
-          readd_to_epoll();
-          return;
-        }
-      }
+      // Here we wait for the descriptor to become read ready or transition
+      // to epoll mode
+      pollfd pfd[] = {{thd_get_fd(thd), POLLIN, 0}, {tp.evfd, POLLIN, 0}};
+      int res = poll(pfd, 2, -1);
       if (res == -1) {
         if (errno == EINTR) {
           // interrupt error, wait on poll again.
@@ -187,6 +172,16 @@ use_thread_per_conn:
           std::raise(SIGABRT);
         }
       }
+      if (pfd[1].revents != 0) {
+        // clear the event
+        uint64_t val;
+        read(tp.evfd, &val, sizeof(val));
+      }
+      if (pfd[0].revents == 0) {
+          // switch to using epoll
+          readd_to_epoll();
+          return;
+      }
       }
 do_command:
       if (thd_connection_alive(thd) && !do_command(thd)) {
@@ -195,9 +190,6 @@ do_command:
           // enough threads for use_thread_per_conn
           goto use_thread_per_conn;
         } else {
-          // not enough threads. using epoll
-          readd_to_epoll();
-          return;
         }
       }
       // this is the error/stop path
@@ -235,16 +227,14 @@ Threadpool& Threadpool::operator=(const Threadpool&) {
 
 bool Threadpool::use_thread_per_conn() {
   if (shutdown.load()) return false;
-  Threads_state state = threads_state.load();
-  return state.count < my_max_threads_per_pool ||
-          state.connection_count < my_max_threads_per_pool;
+  return threads_state.load().connection_count <= my_max_threads_per_pool;
 }
 
 int Threadpool::initialize() {
-  if ((epfd = epoll_create(1)) == -1)
+  if ((epfd = epoll_create1(EPOLL_CLOEXEC)) == -1)
     return errno;
   
-  if ((evfd = eventfd(0, 0)) == -1)
+  if ((evfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)) == -1)
     return errno;
   
   epoll_event epev;
@@ -287,8 +277,7 @@ void Threadpool::shutdown_threads() {
       }
     }
     uint64_t val = 1;
-    if (write(evfd, &val, sizeof(val)) != 8) 
-      std::raise(SIGABRT);
+    write(evfd, &val, sizeof(val));
   }
 }
 
@@ -360,12 +349,11 @@ wait_again:
         std::raise(SIGABRT);
       }
     }
-    if (evt.data.ptr == nullptr) {
+    if (shutdown.load()) {
       // this is our server shutdown event, read the eventfd, decrement count
       // and quit thread
       uint64_t val;
-      if (read(evfd, &val, sizeof(val)) != 8)
-        std::raise(SIGABRT);
+      read(evfd, &val, sizeof(val));
       do {
         state_old = state_new = threads_state.load();
         state_new.count--;
@@ -395,14 +383,9 @@ wait_again:
       int res = spawn_thread();
       if (res) {
         my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
-          "errno %d from spawn_thread.", errno);
-        // couldn't spawn thread likely to to low resources. Decrement count
-        // since no thread was created
-        do {
-          state_old = state_new = threads_state.load();
-          state_new.count--;
-        } while (!threads_state.compare_exchange_weak(state_old, state_new,
-                                                      memory_order_relaxed));
+          "errno %d from spawn_thread. raising SIGABRT", errno);
+        // couldn't spawn thread likely to to low resources. kill server
+        std::raise(SIGABRT);
       }
     }
 
@@ -417,7 +400,7 @@ static atomic<size_t> next_threadpool;
  * Connection_handler_functions
  ******************************************************************************/
 
-bool tp_ep_add_connection(Channel_info *channel_info) {
+static bool add_connection(Channel_info *channel_info) {
   // first assign this connection to a threadpool
   size_t next;
   size_t nextnext;
@@ -438,36 +421,47 @@ bool tp_ep_add_connection(Channel_info *channel_info) {
   destroy_channel_info(channel_info);
  
   Tp_ep_client_event *client_event = new Tp_ep_client_event(tp, thd);
+
+  Threadpool::Threads_state state_old, state_new;
+  do {
+    state_old = state_new = tp.threads_state.load();
+    state_new.connection_count++; // decremented in dtor
+  } while (!tp.threads_state.compare_exchange_weak(state_old, state_new,
+                                                   memory_order_relaxed));
   thd_set_scheduler_data(thd, client_event);
   epoll_event evt;
   evt.events = EPOLLOUT | EPOLLONESHOT;
   evt.data.ptr = client_event;
   if (epoll_ctl(tp.epfd, EPOLL_CTL_ADD, thd_get_fd(thd), &evt)) {
     my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
-      "Error %d in tp_ep_add_connection", errno);
+      "Error %d in Tp_ep_client_event constructor", errno);
     delete client_event;
-    return true;
+  }
+  if (state_new.connection_count == my_max_threads_per_pool + 1) {
+    // signal switch to epoll to any threads waiting in poll
+    uint64_t val = 1;
+    write(tp.evfd, &val, sizeof(val));
   }
 
   return false;
 }
 
-void tp_ep_end() {
+static void end() {
   // stop all threads
   for (Threadpool &tp : threadpools) tp.shutdown_threads();
 }
 
 Connection_handler_functions tp_ep_conn_handler = {
   (uint)get_max_connections(),
-  tp_ep_add_connection,
-  tp_ep_end
+  add_connection,
+  end
 };
 
 /******************************************************************************
  * THD_event_functions
  *****************************************************************************/
 
-void tp_ep_thd_wait_begin(THD *thd, int wait_type) {
+static void thd_wait_begin(THD *thd, int wait_type) {
   if (!thd) return;
 
   switch (wait_type) {
@@ -525,7 +519,7 @@ void tp_ep_thd_wait_begin(THD *thd, int wait_type) {
   }
 }
 
-void tp_ep_thd_wait_end(THD *thd) {
+static void thd_wait_end(THD *thd) {
   if (!thd) return;
 
   Tp_ep_client_event *event = (Tp_ep_client_event*)thd_get_scheduler_data(thd);
@@ -541,7 +535,7 @@ void tp_ep_thd_wait_end(THD *thd) {
   }
 }
 
-void tp_ep_post_kill_notification(THD *thd) {
+static void post_kill_notification(THD *thd) {
   Tp_ep_client_event *event = (Tp_ep_client_event*)thd_get_scheduler_data(thd);
   if (event) {
     shutdown(thd_get_fd(thd), SHUT_RDWR);
@@ -549,16 +543,16 @@ void tp_ep_post_kill_notification(THD *thd) {
 }
 
 THD_event_functions tp_ep_thd_event = {
-  tp_ep_thd_wait_begin,
-  tp_ep_thd_wait_end,
-  tp_ep_post_kill_notification
+  thd_wait_begin,
+  thd_wait_end,
+  post_kill_notification
 };
 
 /******************************************************************************
  * Connection handler module initializer/denitializer
  ******************************************************************************/
 
-static int tp_ep_plugin_init(MYSQL_PLUGIN plugin_ref) {
+static int plugin_init(MYSQL_PLUGIN plugin_ref) {
   DBUG_TRACE;
   threadpool_epoll_plugin = plugin_ref;
 
@@ -589,7 +583,7 @@ errhandle:
   return 1;
 }
 
-static int tp_ep_plugin_deinit(MYSQL_PLUGIN plugin_ref [[maybe_unused]]) {
+static int plugin_deinit(MYSQL_PLUGIN plugin_ref [[maybe_unused]]) {
   // stop all threads
   for (Threadpool &tp : threadpools) tp.shutdown_threads();
   // free the thread pools
@@ -607,12 +601,12 @@ mysql_declare_plugin(threadpool_epoll) {
     "Damien Katz",
     "threadpool and epoll connection handler",
     PLUGIN_LICENSE_PROPRIETARY,
-    tp_ep_plugin_init,    /* Plugin Init */
+    plugin_init,          /* Plugin Init */
     nullptr,              /* Plugin Check uninstall */
-    tp_ep_plugin_deinit,  /* Plugin Deinit */
+    plugin_deinit,        /* Plugin Deinit */
     0x0100,               /* 1.0 */
     nullptr,              /* status variables */
-    threadpool_epoll_system_variables,              /* system variables */
+    threadpool_epoll_system_variables,  /* system variables */
     nullptr,              /* config options */
     0,                    /* flags */
 } mysql_declare_plugin_end;
