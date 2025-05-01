@@ -175,7 +175,7 @@ use_thread_per_conn:
       if (pfd[1].revents != 0) {
         // clear the event
         uint64_t val;
-        read(tp.evfd, &val, sizeof(val));
+        (void)read(tp.evfd, &val, sizeof(val));
       }
       if (pfd[0].revents == 0) {
           // switch to using epoll
@@ -277,7 +277,7 @@ void Threadpool::shutdown_threads() {
       }
     }
     uint64_t val = 1;
-    write(evfd, &val, sizeof(val));
+    (void)write(evfd, &val, sizeof(val));
   }
 }
 
@@ -353,7 +353,7 @@ wait_again:
       // this is our server shutdown event, read the eventfd, decrement count
       // and quit thread
       uint64_t val;
-      read(evfd, &val, sizeof(val));
+      (void)read(evfd, &val, sizeof(val));
       do {
         state_old = state_new = threads_state.load();
         state_new.count--;
@@ -400,7 +400,7 @@ static atomic<size_t> next_threadpool;
  * Connection_handler_functions
  ******************************************************************************/
 
-static bool add_connection(Channel_info *channel_info) {
+static bool tp_ep_add_connection(Channel_info *channel_info) {
   // first assign this connection to a threadpool
   size_t next;
   size_t nextnext;
@@ -440,28 +440,28 @@ static bool add_connection(Channel_info *channel_info) {
   if (state_new.connection_count == my_max_threads_per_pool + 1) {
     // signal switch to epoll to any threads waiting in poll
     uint64_t val = 1;
-    write(tp.evfd, &val, sizeof(val));
+    (void)write(tp.evfd, &val, sizeof(val));
   }
 
   return false;
 }
 
-static void end() {
+static void tp_ep_end() {
   // stop all threads
   for (Threadpool &tp : threadpools) tp.shutdown_threads();
 }
 
 Connection_handler_functions tp_ep_conn_handler = {
   (uint)get_max_connections(),
-  add_connection,
-  end
+  tp_ep_add_connection,
+  tp_ep_end
 };
 
 /******************************************************************************
  * THD_event_functions
  *****************************************************************************/
 
-static void thd_wait_begin(THD *thd, int wait_type) {
+static void tp_ep_thd_wait_begin(THD *thd, int wait_type) {
   if (!thd) return;
 
   switch (wait_type) {
@@ -519,7 +519,7 @@ static void thd_wait_begin(THD *thd, int wait_type) {
   }
 }
 
-static void thd_wait_end(THD *thd) {
+static void tp_ep_thd_wait_end(THD *thd) {
   if (!thd) return;
 
   Tp_ep_client_event *event = (Tp_ep_client_event*)thd_get_scheduler_data(thd);
@@ -535,7 +535,7 @@ static void thd_wait_end(THD *thd) {
   }
 }
 
-static void post_kill_notification(THD *thd) {
+static void tp_ep_post_kill_notification(THD *thd) {
   Tp_ep_client_event *event = (Tp_ep_client_event*)thd_get_scheduler_data(thd);
   if (event) {
     shutdown(thd_get_fd(thd), SHUT_RDWR);
@@ -543,16 +543,16 @@ static void post_kill_notification(THD *thd) {
 }
 
 THD_event_functions tp_ep_thd_event = {
-  thd_wait_begin,
-  thd_wait_end,
-  post_kill_notification
+  tp_ep_thd_wait_begin,
+  tp_ep_thd_wait_end,
+  tp_ep_post_kill_notification
 };
 
 /******************************************************************************
  * Connection handler module initializer/denitializer
  ******************************************************************************/
 
-static int plugin_init(MYSQL_PLUGIN plugin_ref) {
+static int tp_ep_plugin_init(MYSQL_PLUGIN plugin_ref) {
   DBUG_TRACE;
   threadpool_epoll_plugin = plugin_ref;
 
@@ -583,7 +583,7 @@ errhandle:
   return 1;
 }
 
-static int plugin_deinit(MYSQL_PLUGIN plugin_ref [[maybe_unused]]) {
+static int tp_ep_plugin_deinit(MYSQL_PLUGIN plugin_ref [[maybe_unused]]) {
   // stop all threads
   for (Threadpool &tp : threadpools) tp.shutdown_threads();
   // free the thread pools
@@ -601,9 +601,9 @@ mysql_declare_plugin(threadpool_epoll) {
     "Damien Katz",
     "threadpool and epoll connection handler",
     PLUGIN_LICENSE_PROPRIETARY,
-    plugin_init,          /* Plugin Init */
+    tp_ep_plugin_init,          /* Plugin Init */
     nullptr,              /* Plugin Check uninstall */
-    plugin_deinit,        /* Plugin Deinit */
+    tp_ep_plugin_deinit,        /* Plugin Deinit */
     0x0100,               /* 1.0 */
     nullptr,              /* status variables */
     threadpool_epoll_system_variables,  /* system variables */
