@@ -141,7 +141,7 @@ struct Tp_ep_client_event {
           // go the use_thread_per_conn path
           goto use_thread_per_conn;
         } else {
-          // Successful handshake. not enough threads. use epoll
+          // Successful handshake. more connections than threads. use epoll
           readd_to_epoll();
           return;
         }
@@ -350,7 +350,7 @@ wait_again:
         std::raise(SIGABRT);
       }
     }
-    if ((Tp_ep_client_event*)evt.data.ptr == nullptr) {
+    if (evt.data.ptr == nullptr) {
       if (shutdown.load()) {
         // this is our server shutdown/plugin unload event, read the eventfd,
         // decrement count and quit thread
@@ -367,7 +367,7 @@ wait_again:
         return;
       } else {
         // signal to switch to epoll mode. We are already there.
-        continue;
+        goto wait_again;
       }
     }
 
@@ -433,7 +433,7 @@ static bool tp_ep_add_connection(Channel_info *channel_info) {
   Threadpool::Threads_state state_old, state_new;
   do {
     state_old = state_new = tp.threads_state.load();
-    state_new.connection_count++; // decremented in dtor
+    state_new.connection_count++; // decremented in dtor of client_event
   } while (!tp.threads_state.compare_exchange_weak(state_old, state_new,
                                                    memory_order_relaxed));
   thd_set_scheduler_data(thd, client_event);
