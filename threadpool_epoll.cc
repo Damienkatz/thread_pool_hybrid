@@ -11,9 +11,13 @@
 #include "sql/sql_thd_internal_api.h"
 #include "mysql/thread_pool_priv.h"
 
+using namespace std;
 
-static void* tp_thread_start(void *p);
 static MYSQL_PLUGIN threadpool_epoll_plugin;
+
+/******************************************************************************
+ * Plugin global variables
+ ******************************************************************************/
 
 static unsigned int my_total_threadpools = 0;
 static MYSQL_SYSVAR_UINT(
@@ -27,14 +31,14 @@ static MYSQL_SYSVAR_UINT(
   max_threads_per_pool, my_max_threads_per_pool,
   PLUGIN_VAR_READONLY | PLUGIN_VAR_OPCMDARG,
   "Maximum threads per pool",
-  NULL, NULL, 8, 1, 0xFFFF, 0);
+  NULL, NULL, 16, 1, 0xFFFF, 0);
 
-static unsigned int my_min_waiting_threads_per_pool = 2;
+static unsigned int my_min_waiting_threads_per_pool = 4;
 static MYSQL_SYSVAR_UINT(
   min_waiting_threads_per_pool, my_min_waiting_threads_per_pool,
   PLUGIN_VAR_READONLY | PLUGIN_VAR_OPCMDARG,
   "Minimum threads waiting for client io per pool",
-  NULL, NULL, 2, 1, 0xFFFF, 0);
+  NULL, NULL, 4, 1, 0xFFFF, 0);
 
 static SYS_VAR *threadpool_epoll_system_variables[] = {
     MYSQL_SYSVAR(total_threadpools),
@@ -42,17 +46,21 @@ static SYS_VAR *threadpool_epoll_system_variables[] = {
     MYSQL_SYSVAR(min_waiting_threads_per_pool),
     nullptr};
 
-using namespace std;
+/******************************************************************************
+ * Threadpool manages a collection of threads. Threads are per connection
+ * until my_max_threads_per_pool reached in which case the threads use
+ * epoll_wait.
+ ******************************************************************************/
 
 struct Threadpool {
   int epfd = -1;                  /* epoll fd used by pool */
   int evfd = -1;                  /* eventfd used to shutdown the threads */
 
   struct Threads_state {
-    uint32_t count = 0;           /* total threads */
-    uint32_t epoll_waiting = 0;   /* total threads waiting on epoll */
-    uint32_t lock_waiting = 0;    /* total threads waiting on a lock */
-    uint32_t connection_count = 0;/* total clients connected to this threadpool */
+    uint32_t count = 0;           /* total threads in Threadpool*/
+    uint32_t epoll_waiting = 0;   /* total threads waiting on epoll in Threadpool */
+    uint32_t lock_waiting = 0;    /* total threads waiting on a lock in Threadpool */
+    uint32_t connection_count = 0;/* total clients connected to the Threadpool */
   };
 
   atomic<Threads_state> threads_state;
@@ -71,9 +79,16 @@ struct Threadpool {
   int initialize();
   void shutdown_threads();
   int spawn_thread();
-  void thread_loop();
   bool use_thread_per_conn();
+
+  static void* thread_start(void*);
+  void thread_loop();
 };
+
+
+/******************************************************************************
+ * Tp_ep_client_event class + definitions
+ ******************************************************************************/
 
 struct Tp_ep_client_event {
   Threadpool &tp;
@@ -82,7 +97,14 @@ struct Tp_ep_client_event {
   bool in_lock_wait;
 
   Tp_ep_client_event(Threadpool &tp_in, THD *thd_in)
-    : tp(tp_in), thd(thd_in), do_handshake(true), in_lock_wait(false) {}
+    : tp(tp_in), thd(thd_in), do_handshake(true), in_lock_wait(false) {
+      Threadpool::Threads_state state_old, state_new;
+      do {
+        state_old = state_new = tp.threads_state.load();
+        state_new.connection_count++; // decremented in dtor os Tp_ep_client_event
+      } while (!tp.threads_state.compare_exchange_weak(state_old, state_new,
+                                                       memory_order_relaxed));
+    }
 
   ~Tp_ep_client_event() {
     Threadpool::Threads_state state_old, state_new;
@@ -91,6 +113,9 @@ struct Tp_ep_client_event {
       state_new.connection_count--;
     } while (!tp.threads_state.compare_exchange_weak(state_old, state_new,
                                                      memory_order_relaxed));
+
+    destroy_thd(thd, false);
+    dec_connection_count();
   }
 
   void readd_to_epoll() {
@@ -99,9 +124,7 @@ struct Tp_ep_client_event {
     evt.data.ptr = this;
     if (epoll_ctl(tp.epfd, EPOLL_CTL_MOD, thd_get_fd(thd), &evt)) {
       // normal when socketfd closed. clean up here
-      destroy_thd(thd, false);
       delete this;
-      dec_connection_count();
     }
   }
 
@@ -184,13 +207,14 @@ do_command:
     // close the connection, destroy the thd, delete ourself
     close_connection(thd, 0, false, false);
     remove_ssl_err_thread_state();
-    destroy_thd(thd, false);
     delete this;
-    dec_connection_count();
   }
 };
 
 
+/******************************************************************************
+ * Threadpool member definitions
+ ******************************************************************************/
 
 Threadpool::Threadpool() : shutdown(false) {
 }
@@ -273,23 +297,45 @@ int Threadpool::spawn_thread() {
   my_thread_attr_t attr;
   my_thread_attr_init(&attr);
   my_thread_attr_setdetachstate(&attr, MY_THREAD_CREATE_DETACHED);
-  int res = my_thread_create(&thread, &attr, tp_thread_start, this);
+  int res = my_thread_create(&thread, &attr, thread_start, this);
   my_thread_attr_destroy(&attr);
   return res;
+}
+
+void* Threadpool::thread_start(void *p) {
+  Threadpool *tp = (Threadpool*)p;
+
+  if (my_thread_init()) {
+    my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
+      "Threadpool thread failed in my_thread_init()");
+    Threads_state state_old, state_new;
+    do {
+      state_old = state_new = tp->threads_state;
+      state_new.count--;
+    } while (!tp->threads_state.compare_exchange_weak(state_old, state_new,
+                                                      memory_order_relaxed));
+    return nullptr;
+  }
+  my_thread_self_setname("tp_ep_worker");
+
+  tp->thread_loop();
+
+  my_thread_end();
+  return nullptr;
 }
 
 void Threadpool::thread_loop() {
   while (true) {
     epoll_event evt;
     Threads_state state_old, state_new;
-    // keeps us in the range of min_threads_epoll_waiting or 
-    // min_threads_epoll_waiting + 1
+    // keeps epoll_waiting in the range of my_min_waiting_threads_per_pool or 
+    // my_min_waiting_threads_per_pool + 1
     bool thread_die;
     do {
       state_old = state_new = threads_state.load();
       if (shutdown.load() ||
-          state_new.epoll_waiting + 1 > my_min_waiting_threads_per_pool) {
-        // threads_epoll_waiting would become 2 or more than my_min_waiting_threads_per_pool.
+          state_new.epoll_waiting > my_min_waiting_threads_per_pool) {
+        // state_new.epoll_waiting would become 2 or more than my_min_waiting_threads_per_pool.
         // So thread should die.
         state_new.count--;
         thread_die = true;
@@ -302,15 +348,12 @@ void Threadpool::thread_loop() {
     if (thread_die)
       return;
 
+wait_again:
     int cnt = epoll_wait(epfd, &evt, 1, -1);
     if (cnt == -1) {
       if (errno == EINTR) {
-        do {
-          state_old = state_new = threads_state.load();
-          state_new.epoll_waiting--;
-        } while (!threads_state.compare_exchange_weak(state_old, state_new,
-                                                      memory_order_relaxed));
-        continue;
+        // interrupted, wait again
+        goto wait_again;
       } else {
         my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
           "unexpected errno %d from epoll_wait. raising SIGABRT", errno);
@@ -321,7 +364,7 @@ void Threadpool::thread_loop() {
       // this is our server shutdown event, read the eventfd, decrement count
       // and quit thread
       uint64_t val;
-      if (read(evfd, &val, sizeof(val)) != 8) 
+      if (read(evfd, &val, sizeof(val)) != 8)
         std::raise(SIGABRT);
       do {
         state_old = state_new = threads_state.load();
@@ -331,20 +374,24 @@ void Threadpool::thread_loop() {
                                                     memory_order_relaxed));
       return;
     }
-    bool bspawn_thread;
+
+    bool spawnthread;
     do {
+      // we got a regular event. We'll be preoccupied with processing it,
+      // so see if we should spawn another thread before we do.
       state_old = state_new = threads_state.load();
       state_new.epoll_waiting--;
-      if (!shutdown.load() && state_new.epoll_waiting < my_min_waiting_threads_per_pool &&
+      if (!shutdown.load() &&
+          state_new.epoll_waiting < my_min_waiting_threads_per_pool &&
           state_new.count < my_max_threads_per_pool) {
-        bspawn_thread = true;
+        spawnthread = true;
         state_new.count++;
       } else {
-        bspawn_thread = false;
+        spawnthread = false;
       }
     } while (!threads_state.compare_exchange_weak(state_old, state_new,
                                                   memory_order_relaxed));
-    if (bspawn_thread) {
+    if (spawnthread) {
       int res = spawn_thread();
       if (res) {
         my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
@@ -363,31 +410,12 @@ void Threadpool::thread_loop() {
   }
 }
 
-
-static void* tp_thread_start(void *p) {
-  Threadpool *tp = (Threadpool*)p;
-
-  if (my_thread_init()) {
-    my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
-      "Threadpool thread failed in my_thread_init()");
-    Threadpool::Threads_state state_old, state_new;
-    do {
-      state_old = state_new = tp->threads_state;
-      state_new.count--;
-    } while (!tp->threads_state.compare_exchange_weak(state_old, state_new,
-                                                      memory_order_relaxed));
-    return nullptr;
-  }
-  my_thread_self_setname("tp_ep_worker");
-
-  tp->thread_loop();
-
-  my_thread_end();
-  return nullptr;
-}
-
 static vector<Threadpool> threadpools;
 static atomic<size_t> next_threadpool;
+
+/******************************************************************************
+ * Connection_handler_functions
+ ******************************************************************************/
 
 bool tp_ep_add_connection(Channel_info *channel_info) {
   // first assign this connection to a threadpool
@@ -408,24 +436,16 @@ bool tp_ep_add_connection(Channel_info *channel_info) {
     return true;
   }
   destroy_channel_info(channel_info);
-
-  Threadpool::Threads_state state_old, state_new;
-  do {
-    state_old = state_new = tp.threads_state;
-    state_new.connection_count++; // decremented in dtor os Tp_ep_client_event
-  } while (!tp.threads_state.compare_exchange_weak(state_old, state_new,
-                                                    memory_order_relaxed));
-  Tp_ep_client_event *tp_ep_client_event = new Tp_ep_client_event(tp, thd);
-  thd_set_scheduler_data(thd, tp_ep_client_event);
+ 
+  Tp_ep_client_event *client_event = new Tp_ep_client_event(tp, thd);
+  thd_set_scheduler_data(thd, client_event);
   epoll_event evt;
   evt.events = EPOLLOUT | EPOLLONESHOT;
-  evt.data.ptr = tp_ep_client_event;
+  evt.data.ptr = client_event;
   if (epoll_ctl(tp.epfd, EPOLL_CTL_ADD, thd_get_fd(thd), &evt)) {
     my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
       "Error %d in tp_ep_add_connection", errno);
-    destroy_thd(thd, false);
-    delete tp_ep_client_event;
-    dec_connection_count();
+    delete client_event;
     return true;
   }
 
@@ -443,6 +463,9 @@ Connection_handler_functions tp_ep_conn_handler = {
   tp_ep_end
 };
 
+/******************************************************************************
+ * THD_event_functions
+ *****************************************************************************/
 
 void tp_ep_thd_wait_begin(THD *thd, int wait_type) {
   if (!thd) return;
@@ -531,6 +554,9 @@ THD_event_functions tp_ep_thd_event = {
   tp_ep_post_kill_notification
 };
 
+/******************************************************************************
+ * Connection handler module initializer/denitializer
+ ******************************************************************************/
 
 static int tp_ep_plugin_init(MYSQL_PLUGIN plugin_ref) {
   DBUG_TRACE;
