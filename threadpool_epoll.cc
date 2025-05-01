@@ -192,6 +192,9 @@ do_command:
           // enough threads for use_thread_per_conn
           goto use_thread_per_conn;
         } else {
+          // switch to using epoll
+          readd_to_epoll();
+          return;
         }
       }
       // this is the error/stop path
@@ -301,13 +304,7 @@ void* Threadpool::thread_start(void *p) {
   if (my_thread_init()) {
     my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
       "Threadpool thread failed in my_thread_init()");
-    Threads_state state_old, state_new;
-    do {
-      state_old = state_new = tp->threads_state;
-      state_new.count--;
-    } while (!tp->threads_state.compare_exchange_weak(state_old, state_new,
-                                                      memory_order_relaxed));
-    return nullptr;
+    std::raise(SIGABRT);
   }
   my_thread_self_setname("tp_ep_worker");
 
@@ -353,20 +350,25 @@ wait_again:
         std::raise(SIGABRT);
       }
     }
-    if (shutdown.load()) {
-      // this is our server shutdown event, read the eventfd, decrement count
-      // and quit thread
-      uint64_t val;
-      if (read(evfd, &val, sizeof(val))) {
-        // placate compiler -Wunused-result
+    if ((Tp_ep_client_event*)evt.data.ptr == nullptr) {
+      if (shutdown.load()) {
+        // this is our server shutdown/plugin unload event, read the eventfd,
+        // decrement count and quit thread
+        uint64_t val;
+        if (read(evfd, &val, sizeof(val))) {
+          // placate compiler -Wunused-result
+        }
+        do {
+          state_old = state_new = threads_state.load();
+          state_new.count--;
+          state_new.epoll_waiting--;
+        } while (!threads_state.compare_exchange_weak(state_old, state_new,
+                                                      memory_order_relaxed));
+        return;
+      } else {
+        // signal to switch to epoll mode. We are already there.
+        continue;
       }
-      do {
-        state_old = state_new = threads_state.load();
-        state_new.count--;
-        state_new.epoll_waiting--;
-      } while (!threads_state.compare_exchange_weak(state_old, state_new,
-                                                    memory_order_relaxed));
-      return;
     }
 
     bool spawnthread;
