@@ -367,6 +367,11 @@ wait_again:
         return;
       } else {
         // signal to switch to epoll mode. We are already there.
+        // read the event so we don't churn
+        uint64_t val;
+        if (read(evfd, &val, sizeof(val))) {
+          // placate compiler -Wunused-result
+        }
         goto wait_again;
       }
     }
