@@ -175,7 +175,9 @@ use_thread_per_conn:
       if (pfd[1].revents != 0) {
         // clear the event
         uint64_t val;
-        (void)read(tp.evfd, &val, sizeof(val));
+        if (read(evfd, &val, sizeof(val))) {
+          // placate compiler -Wunused-result
+        }
       }
       if (pfd[0].revents == 0) {
           // switch to using epoll
@@ -277,7 +279,9 @@ void Threadpool::shutdown_threads() {
       }
     }
     uint64_t val = 1;
-    (void)write(evfd, &val, sizeof(val));
+    if (write(evfd, &val, sizeof(val))) {
+      // placate compiler -Wunused-result
+    }
   }
 }
 
@@ -353,7 +357,9 @@ wait_again:
       // this is our server shutdown event, read the eventfd, decrement count
       // and quit thread
       uint64_t val;
-      (void)read(evfd, &val, sizeof(val));
+      if (read(evfd, &val, sizeof(val))) {
+        // placate compiler -Wunused-result
+      }
       do {
         state_old = state_new = threads_state.load();
         state_new.count--;
@@ -440,7 +446,9 @@ static bool tp_ep_add_connection(Channel_info *channel_info) {
   if (state_new.connection_count == my_max_threads_per_pool + 1) {
     // signal switch to epoll to any threads waiting in poll
     uint64_t val = 1;
-    (void)write(tp.evfd, &val, sizeof(val));
+    if (write(evfd, &val, sizeof(val))) {
+      // placate compiler -Wunused-result
+    }
   }
 
   return false;
