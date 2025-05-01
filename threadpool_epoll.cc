@@ -175,7 +175,7 @@ use_thread_per_conn:
       if (pfd[1].revents != 0) {
         // clear the event
         uint64_t val;
-        if (read(evfd, &val, sizeof(val))) {
+        if (read(tp.evfd, &val, sizeof(val))) {
           // placate compiler -Wunused-result
         }
       }
@@ -446,7 +446,7 @@ static bool tp_ep_add_connection(Channel_info *channel_info) {
   if (state_new.connection_count == my_max_threads_per_pool + 1) {
     // signal switch to epoll to any threads waiting in poll
     uint64_t val = 1;
-    if (write(evfd, &val, sizeof(val))) {
+    if (write(tp.evfd, &val, sizeof(val))) {
       // placate compiler -Wunused-result
     }
   }
