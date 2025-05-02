@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <vector>
 #include <chrono>
 #include <csignal>
@@ -114,7 +117,7 @@ struct Tp_ep_client_event {
 
   void readd_to_epoll() {
     epoll_event evt;
-    evt.events = EPOLLIN | EPOLLONESHOT;
+    evt.events = EPOLLIN | EPOLLRDHUP | EPOLLONESHOT;
     evt.data.ptr = this;
     if (epoll_ctl(tp.epfd, EPOLL_CTL_MOD, thd_get_fd(thd), &evt)) {
       my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
@@ -159,7 +162,8 @@ use_thread_per_conn:
       {
       // Here we wait for the descriptor to become read ready or transition
       // to epoll mode
-      pollfd pfd[] = {{thd_get_fd(thd), POLLIN, 0}, {tp.evfd, POLLIN, 0}};
+      pollfd pfd[] = {{thd_get_fd(thd), POLLIN | POLLRDHUP, 0},
+                      {tp.evfd, POLLIN | POLLRDHUP, 0}};
       int res = poll(pfd, 2, -1);
       if (res == -1) {
         if (errno == EINTR) {
@@ -443,7 +447,7 @@ static bool tp_ep_add_connection(Channel_info *channel_info) {
                                                    memory_order_relaxed));
   thd_set_scheduler_data(thd, client_event);
   epoll_event evt;
-  evt.events = EPOLLOUT | EPOLLONESHOT;
+  evt.events = EPOLLOUT | EPOLLRDHUP| EPOLLONESHOT;
   evt.data.ptr = client_event;
   if (epoll_ctl(tp.epfd, EPOLL_CTL_ADD, thd_get_fd(thd), &evt)) {
     my_plugin_log_message(&threadpool_epoll_plugin, MY_ERROR_LEVEL,
