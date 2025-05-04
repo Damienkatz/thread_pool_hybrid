@@ -512,7 +512,7 @@ Connection_handler_functions conn_handler = {
  * THD_event_functions
  *****************************************************************************/
 
-static void thd_wait_begin(THD *thd, int wait_type) {
+static void Thd_wait_begin(THD *thd, int wait_type) {
   if (!thd) return;
 
   switch (wait_type) {
@@ -570,7 +570,7 @@ static void thd_wait_begin(THD *thd, int wait_type) {
   }
 }
 
-static void thd_wait_end(THD *thd) {
+static void Thd_wait_end(THD *thd) {
   if (!thd) return;
 
   Client_event *event = (Client_event*)thd_get_scheduler_data(thd);
@@ -586,7 +586,7 @@ static void thd_wait_end(THD *thd) {
   }
 }
 
-static void post_kill_notification(THD *thd) {
+static void Post_kill_notification(THD *thd) {
   Client_event *event = (Client_event*)thd_get_scheduler_data(thd);
   if (event) {
     shutdown(thd_get_fd(thd), SHUT_RDWR);
@@ -594,9 +594,9 @@ static void post_kill_notification(THD *thd) {
 }
 
 THD_event_functions thd_event = {
-  thd_wait_begin,
-  thd_wait_end,
-  post_kill_notification
+  Thd_wait_begin,
+  Thd_wait_end,
+  Post_kill_notification
 };
 
 /******************************************************************************
