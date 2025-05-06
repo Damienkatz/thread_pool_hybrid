@@ -121,7 +121,6 @@ struct Thread_pool {
   void thread_loop();
 };
 
-
 /******************************************************************************
  * Client_event class + definitions
  ******************************************************************************/
@@ -571,7 +570,7 @@ static void Thd_wait_begin(THD *thd, int wait_type) {
         // encode our that this thd is waiting on locks in the unused bits in the
         // pointer to the thd's scheduler_data. Least Significant Bit is fine, as
         // the tp will be 64bit aligned and never odd.
-        thd_set_scheduler_data(thd, (void *)((uintptr_t)tp &  ~((uintptr_t)1)));
+        thd_set_scheduler_data(thd, (void *)((uintptr_t)tp | (uintptr_t)1));
 
         if (!spawnthread)
           return;
@@ -596,14 +595,14 @@ static void Thd_wait_begin(THD *thd, int wait_type) {
 
 static void Thd_wait_end(THD *thd) {
   if (!thd) return;
-  // see if e've encoded that this thread is in a lock (see Thd_wait_begin) in
+  // see if we've encoded that this thread is in a lock (see Thd_wait_begin) in
   // the scheduler data 
   uintptr_t encoded_ptr = (uintptr_t)thd_get_scheduler_data(thd);
   bool is_in_lock = (encoded_ptr & (uintptr_t)1) != 0;
 
   if (is_in_lock) {
     // strip out the is_in_lock bit
-    Thread_pool &tp = *(Thread_pool*)(encoded_ptr & (~(uintptr_t)1));
+    Thread_pool &tp = *(Thread_pool*)(encoded_ptr & ~(uintptr_t)1);
     thd_set_scheduler_data(thd, &tp);
     Thread_pool::Threads_state state_old, state_new;
     do {
@@ -619,7 +618,7 @@ static void Post_kill_notification(THD *thd) {
   if (thd_get_scheduler_data(thd)) {
     // its one of ours, shutdown the fd but don't close,
     // that way we get an epoll event and clean it up
-    shutdown(thd_get_fd(thd), SHUT_RDWR);
+    thd_close_connection(thd);
   }
 }
 
