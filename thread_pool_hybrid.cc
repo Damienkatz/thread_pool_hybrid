@@ -44,6 +44,7 @@ static MYSQL_PLUGIN thread_pool_hybrid_plugin;
  ******************************************************************************/
 
 static unsigned int total_thread_pools = 0;
+
 static MYSQL_SYSVAR_UINT(
   total_thread_pools, total_thread_pools,
   PLUGIN_VAR_READONLY | PLUGIN_VAR_OPCMDARG,
@@ -51,6 +52,7 @@ static MYSQL_SYSVAR_UINT(
   NULL, NULL, 0, 0, 0xFFFF, 0);
 
 static unsigned int max_threads_per_pool = 1;
+
 static MYSQL_SYSVAR_UINT(
   max_threads_per_pool, max_threads_per_pool,
   PLUGIN_VAR_READONLY | PLUGIN_VAR_OPCMDARG,
@@ -58,6 +60,7 @@ static MYSQL_SYSVAR_UINT(
   NULL, NULL, 16, 2, 0xFFFF, 0);
 
 static unsigned int min_waiting_threads_per_pool = 4;
+
 static MYSQL_SYSVAR_UINT(
   min_waiting_threads_per_pool, min_waiting_threads_per_pool,
   PLUGIN_VAR_READONLY | PLUGIN_VAR_OPCMDARG,
@@ -65,10 +68,22 @@ static MYSQL_SYSVAR_UINT(
   "Must be at least 1 less than thread_pool_hybrid_total_thread_pools.",
   NULL, NULL, 4, 1, 0xFFFF, 0);
 
+static bool enable_connection_per_thread_mode;
+
+static MYSQL_SYSVAR_BOOL(
+  enable_connection_per_thread_mode, enable_connection_per_thread_mode,
+  PLUGIN_VAR_READONLY | PLUGIN_VAR_OPCMDARG,
+  "Enable each thread to use poll w/ it's assigned client when the count "
+  "of connections is less than or equal to max_threads_per_pool.",
+  nullptr, /* check func*/
+  nullptr, /* update func*/
+  true);      /* default*/
+
 static SYS_VAR *system_variables[] = {
     MYSQL_SYSVAR(total_thread_pools),
     MYSQL_SYSVAR(max_threads_per_pool),
     MYSQL_SYSVAR(min_waiting_threads_per_pool),
+    MYSQL_SYSVAR(enable_connection_per_thread_mode),
     nullptr};
 
 /******************************************************************************
@@ -263,7 +278,8 @@ Thread_pool::~Thread_pool() {
 }
 
 bool Thread_pool::use_connection_per_thread() {
-  return threads_state.load().connection_count <= max_threads_per_pool;
+  return enable_connection_per_thread_mode &&
+          threads_state.load().connection_count <= max_threads_per_pool;
 }
 
 int Thread_pool::initialize() {
@@ -478,7 +494,8 @@ static bool add_connection(Channel_info *channel_info) {
   } while (!tp.threads_state.compare_exchange_weak(state_old, state_new,
                                                    memory_order_relaxed));
   
-  if (state_new.connection_count == max_threads_per_pool + 1) {
+  if (enable_connection_per_thread_mode &&
+      state_new.connection_count == max_threads_per_pool + 1) {
     // signal switch to epoll to any threads waiting in poll
     uint64_t val = state_new.connection_count;
     if (write(tp.evfd_poll, &val, sizeof(val))) {
