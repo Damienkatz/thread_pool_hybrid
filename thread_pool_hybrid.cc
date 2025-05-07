@@ -386,9 +386,11 @@ void Thread_pool::thread_loop() {
     bool thread_die;
     do {
       state_old = state_new = threads_state.load();
-      if (state_new.epoll_waiting > min_waiting_threads_per_pool) {
+      if (state_new.epoll_waiting > min_waiting_threads_per_pool &&
+          state_new.lock_waiting + 1 < state_new.count) {
         // state_new.epoll_waiting would become 2 or more than
-        // min_waiting_threads_per_pool.
+        // min_waiting_threads_per_pool, also our thread count
+        // won't drop to equal the count of lock waiting.
         // So thread should die.
         state_new.count--;
         thread_die = true;
@@ -534,6 +536,8 @@ Connection_handler_functions conn_handler = {
  *****************************************************************************/
 
 static void Thd_wait_begin(THD *thd, int wait_type) {
+  if (!thd)
+    thd = thd_get_current_thd();
   if (!thd) return;
 
   switch (wait_type) {
@@ -594,6 +598,8 @@ static void Thd_wait_begin(THD *thd, int wait_type) {
 }
 
 static void Thd_wait_end(THD *thd) {
+  if (!thd)
+    thd = thd_get_current_thd();
   if (!thd) return;
   // see if we've encoded that this thread is in a lock (see Thd_wait_begin) in
   // the scheduler data 
@@ -616,8 +622,8 @@ static void Thd_wait_end(THD *thd) {
 
 static void Post_kill_notification(THD *thd) {
   if (thd_get_scheduler_data(thd)) {
-    // its one of ours, shutdown the fd but don't close,
-    // that way we get an epoll event and clean it up
+    // There is scehdule_data. its one of ours, shutdown the fd but don't close,
+    // that way we get an epoll or poll event and clean it up
     thd_close_connection(thd);
   }
 }
