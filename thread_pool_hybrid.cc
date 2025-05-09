@@ -233,7 +233,7 @@ use_connection_per_thread:
       } // else fall through to processing the connection
       }
 do_command:
-      if (thd_connection_alive(thd) && !do_command(thd)) {
+      if (thd_connection_has_data(thd) && !do_command(thd)) {
         // successfully processed. 
         if (tp.use_connection_per_thread()) {
           // We have enough threads available to go the
