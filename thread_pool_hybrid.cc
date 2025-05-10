@@ -233,24 +233,44 @@ use_connection_per_thread:
       } // else fall through to processing the connection
       }
 do_command:
-      if (thd_connection_has_data(thd) && !do_command(thd)) {
-        // successfully processed. 
-        if (tp.use_connection_per_thread()) {
-          // We have enough threads available to go the
-          // use_connection_per_thread path. If we should be in epoll
-          // we'll get an event through evfd_poll and kick us out into epoll.
-          // So it's ok that the call to tp.use_connection_per_thread()
-          // can switch to false before we call poll.
-          goto use_connection_per_thread;
-        } else {
-          // More connections than threads. use epoll.
-          // it's ok to be in epoll when we should be in poll, because any
-          // client event in epoll will kick us back to the poll path.
-          // But it's not ok to be in poll when we should be epoll, because
-          // only the client event for the specifc connection can fire and
-          // wake us up.
-          readd_to_epoll();
-          return;
+      while (!do_command(thd)) {
+        if (thd_connection_has_data(thd)) continue; // call do_command
+do_poll_again:
+        // poll with zero timeout to see if there is data in the network buffer
+        pollfd pfd[] = {{thd_get_fd(thd), POLLIN | POLLRDHUP, 0}};
+        int res = poll(pfd, 1, 0);
+        if (res == -1) {
+          if (errno == EINTR) {
+            // interrupt error, wait on poll again.
+            goto do_poll_again;
+          } else {
+            // don't know this error. abort
+            my_plugin_log_message(&thread_pool_hybrid_plugin, MY_ERROR_LEVEL,
+              "unexpected errno %d from poll. raising SIGABRT", errno);
+            std::raise(SIGABRT);
+          }
+        } else if (res == 1) {
+          // data is waiting
+          continue; // call do_command
+        } else if (res == 0) {
+          // no data or error waiting
+          if (tp.use_connection_per_thread()) {
+            // We have enough threads available to go the
+            // use_connection_per_thread path. If we should be in epoll
+            // we'll get an event through evfd_poll and kick us out into epoll.
+            // So it's ok that the call to tp.use_connection_per_thread()
+            // can switch to false before we call poll.
+            goto use_connection_per_thread;
+          } else {
+            // More connections than threads. use epoll.
+            // it's ok to be in epoll when we should be in poll, because any
+            // client event in epoll will kick us back to the poll path.
+            // But it's not ok to be in poll when we should be epoll, because
+            // only the client event for the specifc connection can fire and
+            // wake us up.
+            readd_to_epoll();
+            return;
+          }
         }
       }
       // this is the error/stop path
