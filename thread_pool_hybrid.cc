@@ -152,19 +152,24 @@ struct Client_event {
     evt.events = EPOLLIN | EPOLLRDHUP | EPOLLONESHOT;
     evt.data.ptr = thd;
     if (epoll_ctl(tp.epfd, EPOLL_CTL_MOD, thd_get_fd(thd), &evt)) {
-      // normal when fd closed.
+      // normal when fd closed. clean up code will free the
+      // Client_event
+      my_plugin_log_message(&thread_pool_hybrid_plugin, MY_ERROR_LEVEL,
+        "unexpected errno %d from epoll_ctl(EPOLL_CTL_MOD,...). raising SIGABRT", errno);
+      std::raise(SIGABRT);
     }
   }
 
   void del_from_epoll() {
     if (epoll_ctl(tp.epfd, EPOLL_CTL_DEL, thd_get_fd(thd), nullptr)) {
-      // normal when fd closed.
+      // normal when fd closed. clean up code will free the
+      // Client_event
     }
   }
 
-  void process(int epoll_events) {
+  void process(bool needs_handshake) {
     char thread_top = 0;
-    if (epoll_events & EPOLLOUT) {
+    if (needs_handshake) {
       thd_init(thd, &thread_top);
       if (!thd_prepare_connection(thd)) {
         if (tp.use_connection_per_thread()) {
@@ -225,46 +230,54 @@ use_connection_per_thread:
           // only got the previous switch to epoll event. So do the switch
           readd_to_epoll();
           return;
-      } else if ((pfd[0].revents & POLLRDHUP) || (pfd[0].revents & POLLHUP)) {
-        // no need to readd or delete, just process and close our end
-        epoll_events = (EPOLLRDHUP | EPOLLHUP);
-      }
+      } // else fall through to processing the connection
       }
 do_command:
-      if (do_command(thd)) {
-        // this is the error/stop path
-        del_from_epoll();
-        end_connection(thd);
-        clean_up_thd();
-        return;
+      while (!do_command(thd)) {
+        if (thd_connection_has_data(thd)) continue; // call do_command
+do_poll_again:
+        // poll with zero timeout to see if there is data in the network buffer
+        pollfd pfd[] = {{thd_get_fd(thd), POLLIN | POLLRDHUP, 0}};
+        int res = poll(pfd, 1, 0);
+        if (res == -1) {
+          if (errno == EINTR) {
+            // interrupt error, wait on poll again.
+            goto do_poll_again;
+          } else {
+            // don't know this error. abort
+            my_plugin_log_message(&thread_pool_hybrid_plugin, MY_ERROR_LEVEL,
+              "unexpected errno %d from poll. raising SIGABRT", errno);
+            std::raise(SIGABRT);
+          }
+        } else if (res == 1) {
+          // data is waiting
+          continue; // call do_command
+        } else if (res == 0) {
+          // no data or error waiting
+          if (tp.use_connection_per_thread()) {
+            // We have enough threads available to go the
+            // use_connection_per_thread path. If we should be in epoll
+            // we'll get an event through evfd_poll and kick us out into epoll.
+            // So it's ok that the call to tp.use_connection_per_thread()
+            // can switch to false before we call poll.
+            goto use_connection_per_thread;
+          } else {
+            // More connections than threads. use epoll.
+            // it's ok to be in epoll when we should be in poll, because any
+            // client event in epoll will kick us back to the poll path.
+            // But it's not ok to be in poll when we should be epoll, because
+            // only the client event for the specifc connection can fire and
+            // wake us up.
+            readd_to_epoll();
+            return;
+          }
+        }
       }
-      if (epoll_events & (EPOLLRDHUP | EPOLLHUP)) {
-        // connection is done and saoon to be or already removed from epoll
-        // by the kernel
-        end_connection(thd);
-        clean_up_thd();
-        return;
-      }
-      // successfully processed. wait for next request
-      if (tp.use_connection_per_thread()) {
-        // We have enough threads available to go the
-        // use_connection_per_thread path. If we should be in epoll
-        // we'll get an event through evfd_poll and kick us out into epoll.
-        // So it's ok that the call to tp.use_connection_per_thread()
-        // can switch to false before we call poll.
-        epoll_events = 0;
-        goto use_connection_per_thread;
-      } else {
-        // More connections than threads. use epoll.
-        // it's ok to be in epoll when we should be in poll, because any
-        // client event in epoll will kick us back to the poll path.
-        // But it's not ok to be in poll when we should be epoll, because
-        // only the client event for the specifc connection can fire and
-        // wake us up.
-        readd_to_epoll();
-        return;
-      }
+      // this is the error/stop path
+      del_from_epoll();
+      end_connection(thd);
     }
+    clean_up_thd();
   }
 };
 
@@ -460,7 +473,10 @@ wait_again:
         std::raise(SIGABRT);
       }
     }
-    Client_event(*this, (THD *)evt.data.ptr).process(evt.events);
+    // only get EPOLLOUT on new connections, it indicates
+    // we need to handshake the client
+    bool needs_handshake = (EPOLLOUT & evt.events) != 0;
+    Client_event(*this, (THD *)evt.data.ptr).process(needs_handshake);
   }
 }
 
