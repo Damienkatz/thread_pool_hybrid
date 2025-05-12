@@ -138,10 +138,9 @@ struct Client_event {
     close_connection(thd, 0, false, false);
     Thread_pool::Threads_state state_old, state_new;
     do {
-      state_old = state_new = tp.threads_state.load();
+      state_old = state_new = tp.threads_state;
       state_new.connection_count--;
-    } while (!tp.threads_state.compare_exchange_weak(state_old, state_new,
-                                                     memory_order_relaxed));
+    } while (!tp.threads_state.compare_exchange_weak(state_old, state_new));
 
     destroy_thd(thd, false);
     dec_connection_count();
@@ -298,18 +297,16 @@ int Thread_pool::initialize() {
   for (size_t i = 0; i < min_waiting_threads_per_pool; i++) {
     Threads_state state_old, state_new;
     do {
-      state_old = state_new = threads_state.load();
+      state_old = state_new = threads_state;
       state_new.count++;
-    } while (!threads_state.compare_exchange_weak(state_old, state_new,
-                                                  memory_order_relaxed));
+    } while (!threads_state.compare_exchange_weak(state_old, state_new));
     int res = spawn_thread();
     if (res) {
       // thread not created, decrement count and return error
       do {
-        state_old = state_new = threads_state.load();
+        state_old = state_new = threads_state;
         state_new.count--;
-      } while (!threads_state.compare_exchange_weak(state_old, state_new,
-                                                    memory_order_relaxed));
+      } while (!threads_state.compare_exchange_weak(state_old, state_new));
       return res;
     }
   }
@@ -383,12 +380,12 @@ void Thread_pool::thread_loop() {
     // min_waiting_threads_per_pool + 1
     bool thread_die;
     do {
-      state_old = state_new = threads_state.load();
-      if (state_new.epoll_waiting > min_waiting_threads_per_pool + 1 &&
+      state_old = state_new = threads_state;
+      if (state_new.epoll_waiting > min_waiting_threads_per_pool &&
           state_new.lock_waiting + 1 < state_new.count) {
         // state_new.epoll_waiting would become 2 or more than
         // min_waiting_threads_per_pool, also our thread count
-        // won't drop to equal the count of lock waiting.
+        // will still be bigger than the count of lock waiting.
         // So thread should die.
         state_new.count--;
         thread_die = true;
@@ -396,8 +393,7 @@ void Thread_pool::thread_loop() {
         state_new.epoll_waiting++;
         thread_die = false;
       }
-    } while (!threads_state.compare_exchange_weak(state_old, state_new,
-                                                  memory_order_relaxed));
+    } while (!threads_state.compare_exchange_weak(state_old, state_new));
     if (thread_die)
       return;
 
@@ -419,11 +415,10 @@ wait_again:
       // epoll_wwait will get this event
       // Decrement count and quit thread
       do {
-        state_old = state_new = threads_state.load();
+        state_old = state_new = threads_state;
         state_new.count--;
         state_new.epoll_waiting--;
-      } while (!threads_state.compare_exchange_weak(state_old, state_new,
-                                                    memory_order_relaxed));
+      } while (!threads_state.compare_exchange_weak(state_old, state_new));
       return;
     }
 
@@ -431,7 +426,7 @@ wait_again:
     do {
       // we got a regular event. We'll be preoccupied with processing it,
       // so see if we should spawn another thread before we do.
-      state_old = state_new = threads_state.load();
+      state_old = state_new = threads_state;
       state_new.epoll_waiting--;
       if (state_new.epoll_waiting < min_waiting_threads_per_pool &&
           state_new.count < max_threads_per_pool) {
@@ -440,8 +435,7 @@ wait_again:
       } else {
         spawnthread = false;
       }
-    } while (!threads_state.compare_exchange_weak(state_old, state_new,
-                                                  memory_order_relaxed));
+    } while (!threads_state.compare_exchange_weak(state_old, state_new));
     if (spawnthread) {
       int res = spawn_thread();
       if (res) {
@@ -470,11 +464,10 @@ static bool add_connection(Channel_info *channel_info) {
   size_t next;
   size_t nextnext;
   do {
-     next = next_thread_pool.load(memory_order_relaxed);
+     next = next_thread_pool;
      nextnext = next + 1;
      if (nextnext == total_thread_pools) nextnext = 0;
-  } while (!next_thread_pool.compare_exchange_weak(next, nextnext,
-                                                   memory_order_relaxed));
+  } while (!next_thread_pool.compare_exchange_weak(next, nextnext));
 
   Thread_pool &tp = thread_pools[next];
 
@@ -488,10 +481,9 @@ static bool add_connection(Channel_info *channel_info) {
 
   Thread_pool::Threads_state state_old, state_new;
   do {
-    state_old = state_new = tp.threads_state.load();
+    state_old = state_new = tp.threads_state;
     state_new.connection_count++; // decremented in Client_event::clean_up_thd()
-  } while (!tp.threads_state.compare_exchange_weak(state_old, state_new,
-                                                   memory_order_relaxed));
+  } while (!tp.threads_state.compare_exchange_weak(state_old, state_new));
   
   if (enable_connection_per_thread_mode &&
       state_new.connection_count == max_threads_per_pool + 1) {
@@ -566,8 +558,7 @@ static void Thd_wait_begin(THD *thd, int wait_type) {
           } else {
             spawnthread = false;
           }
-        } while (!tp->threads_state.compare_exchange_weak(state_old, state_new,
-                                                          memory_order_relaxed));
+        } while (!tp->threads_state.compare_exchange_weak(state_old, state_new));
         
         // encode our that this thd is waiting on locks in the unused bits in the
         // pointer to the thd's scheduler_data. Least Significant Bit is fine, as
@@ -608,8 +599,7 @@ static void Thd_wait_end(THD *thd) {
     do {
       state_old = state_new = tp.threads_state;
       state_new.lock_waiting--;
-    } while (!tp.threads_state.compare_exchange_weak(state_old, state_new,
-                                                     memory_order_relaxed));
+    } while (!tp.threads_state.compare_exchange_weak(state_old, state_new));
     
   }
 }
