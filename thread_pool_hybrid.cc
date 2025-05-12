@@ -152,8 +152,6 @@ struct Client_event {
     evt.events = EPOLLIN | EPOLLRDHUP | EPOLLONESHOT;
     evt.data.ptr = thd;
     if (epoll_ctl(tp.epfd, EPOLL_CTL_MOD, thd_get_fd(thd), &evt)) {
-      // normal when fd closed. clean up code will free the
-      // Client_event
       my_plugin_log_message(&thread_pool_hybrid_plugin, MY_ERROR_LEVEL,
         "unexpected errno %d from epoll_ctl(EPOLL_CTL_MOD,...). raising SIGABRT", errno);
       std::raise(SIGABRT);
@@ -386,7 +384,7 @@ void Thread_pool::thread_loop() {
     bool thread_die;
     do {
       state_old = state_new = threads_state.load();
-      if (state_new.epoll_waiting > min_waiting_threads_per_pool &&
+      if (state_new.epoll_waiting > min_waiting_threads_per_pool + 1 &&
           state_new.lock_waiting + 1 < state_new.count) {
         // state_new.epoll_waiting would become 2 or more than
         // min_waiting_threads_per_pool, also our thread count
@@ -449,7 +447,7 @@ wait_again:
       if (res) {
         my_plugin_log_message(&thread_pool_hybrid_plugin, MY_ERROR_LEVEL,
           "errno %d from spawn_thread. raising SIGABRT", errno);
-        // couldn't spawn thread likely to to low resources. kill server
+        // couldn't spawn thread likely due to low resources. kill server
         std::raise(SIGABRT);
       }
     }
@@ -583,11 +581,7 @@ static void Thd_wait_begin(THD *thd, int wait_type) {
         if (res) {
           my_plugin_log_message(&thread_pool_hybrid_plugin, MY_ERROR_LEVEL,
             "Error %d in thd_wait_begin()", res);
-          do {
-            state_old = state_new = tp->threads_state;
-            state_new.count--;
-          } while (!tp->threads_state.compare_exchange_weak(state_old, state_new,
-                                                            memory_order_relaxed));
+          std::raise(SIGABRT);
         }
       }
       break;
