@@ -294,7 +294,7 @@ int Thread_pool::initialize() {
   if (epoll_ctl(epfd, EPOLL_CTL_ADD, evfd_epoll, &epev) == -1)
     return errno;
 
-  for (size_t i = 0; i < min_waiting_threads_per_pool; i++) {
+  for (size_t i = 0; i < max_threads_per_pool; i++) {
     Threads_state state_old, state_new;
     do {
       state_old = state_new = threads_state;
@@ -376,17 +376,11 @@ void Thread_pool::thread_loop() {
   while (true) {
     epoll_event evt;
     Threads_state state_old, state_new;
-    // keeps epoll_waiting in the range of min_waiting_threads_per_pool or 
-    // min_waiting_threads_per_pool + 1
     bool thread_die;
     do {
       state_old = state_new = threads_state;
-      if (state_new.epoll_waiting > min_waiting_threads_per_pool &&
-          state_new.lock_waiting + 1 < state_new.count) {
-        // state_new.epoll_waiting would become 2 or more than
-        // min_waiting_threads_per_pool, also our thread count
-        // will still be bigger than the count of lock waiting.
-        // So thread should die.
+      if (state_new.lock_waiting + 1 < state_new.count &&
+          state_new.count > max_threads_per_pool) {
         state_new.count--;
         thread_die = true;
       } else {
@@ -422,29 +416,11 @@ wait_again:
       return;
     }
 
-    bool spawnthread;
     do {
-      // we got a regular event. We'll be preoccupied with processing it,
-      // so see if we should spawn another thread before we do.
       state_old = state_new = threads_state;
       state_new.epoll_waiting--;
-      if (state_new.epoll_waiting < min_waiting_threads_per_pool &&
-          state_new.count < max_threads_per_pool) {
-        spawnthread = true;
-        state_new.count++;
-      } else {
-        spawnthread = false;
-      }
     } while (!threads_state.compare_exchange_weak(state_old, state_new));
-    if (spawnthread) {
-      int res = spawn_thread();
-      if (res) {
-        my_plugin_log_message(&thread_pool_hybrid_plugin, MY_ERROR_LEVEL,
-          "errno %d from spawn_thread. raising SIGABRT", errno);
-        // couldn't spawn thread likely due to low resources. kill server
-        std::raise(SIGABRT);
-      }
-    }
+
     // only get EPOLLOUT on new connections, it indicates
     // we need to handshake the client
     bool needs_handshake = (EPOLLOUT & evt.events) != 0;
