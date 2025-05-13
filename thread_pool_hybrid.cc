@@ -376,20 +376,10 @@ void Thread_pool::thread_loop() {
   while (true) {
     epoll_event evt;
     Threads_state state_old, state_new;
-    bool thread_die;
     do {
       state_old = state_new = threads_state;
-      if (state_new.lock_waiting + 1 < state_new.count &&
-          state_new.count > max_threads_per_pool) {
-        state_new.count--;
-        thread_die = true;
-      } else {
-        state_new.epoll_waiting++;
-        thread_die = false;
-      }
+      state_new.epoll_waiting++;
     } while (!threads_state.compare_exchange_weak(state_old, state_new));
-    if (thread_die)
-      return;
 
 wait_again:
     int cnt = epoll_wait(epfd, &evt, 1, -1);
@@ -464,7 +454,7 @@ static bool add_connection(Channel_info *channel_info) {
   if (enable_connection_per_thread_mode &&
       state_new.connection_count == max_threads_per_pool + 1) {
     // signal switch to epoll to any threads waiting in poll
-    uint64_t val = state_new.connection_count;
+    uint64_t val = max_threads_per_pool;
     if (write(tp.evfd_poll, &val, sizeof(val))) {
       // placate compiler -Wunused-result
     }
