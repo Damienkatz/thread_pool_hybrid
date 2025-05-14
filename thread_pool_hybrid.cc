@@ -705,7 +705,7 @@ static int plugin_deinit(MYSQL_PLUGIN plugin_ref [[maybe_unused]]) {
   delete[] thread_pools;
   (void)my_connection_handler_reset();
 
-  if (debug_file)) {
+  if (debug_file) {
     flose(debug_file);
   }
   return 0;
