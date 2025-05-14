@@ -706,7 +706,7 @@ static int plugin_deinit(MYSQL_PLUGIN plugin_ref [[maybe_unused]]) {
   (void)my_connection_handler_reset();
 
   if (debug_file) {
-    flose(debug_file);
+    fclose(debug_file);
   }
   return 0;
 }
