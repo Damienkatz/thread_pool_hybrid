@@ -8,6 +8,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/sysinfo.h>
+#include <sys/ioctl.h>
 
 #include "mysql/plugin.h"
 #include "my_thread.h"
@@ -79,11 +80,36 @@ static MYSQL_SYSVAR_BOOL(
   nullptr, /* update func*/
   true);      /* default*/
 
+static char debug_out_file[PATH_MAX] = "\0";
+static char* debug_out_file2 = (char*)debug_out_file;
+static FILE *debug_file = nullptr;
+static void update_debug_out_file(MYSQL_THD, SYS_VAR *var [[maybe_unused]], void *var_ptr,
+                                  const void *save [[maybe_unused]]) {
+  char *in = (char *)var_ptr;
+  FILE *debug_file_in = fopen(in, "w");
+  if (debug_file_in != NULL) {
+    if (debug_file)
+      fclose(debug_file);
+    debug_file = debug_file_in;
+    strncpy(debug_out_file, in, sizeof(debug_out_file));
+    debug_out_file[sizeof(debug_out_file) - 1] = '\0'; // Ensure null termination
+  }
+}
+
+static MYSQL_SYSVAR_STR(
+  debug_out_file, debug_out_file2,
+  PLUGIN_VAR_OPCMDARG,
+  "Enable debug messages output to filename.",
+  nullptr, /* check func*/
+  update_debug_out_file, /* update func*/
+  "");
+
 static SYS_VAR *system_variables[] = {
     MYSQL_SYSVAR(total_thread_pools),
     MYSQL_SYSVAR(max_threads_per_pool),
     MYSQL_SYSVAR(min_waiting_threads_per_pool),
     MYSQL_SYSVAR(enable_connection_per_thread_mode),
+    MYSQL_SYSVAR(debug_out_file),
     nullptr};
 
 /******************************************************************************
@@ -409,10 +435,10 @@ wait_again:
         std::raise(SIGABRT);
       }
     }
-    if (evt.data.ptr == nullptr) {
+    if (shutdown.load()) {
       // this is our server shutdown/plugin-unload event.
       // Don't read from epfd_epoll and any thread that calls
-      // epoll_wwait will get this event
+      // epoll_wait will get this event
       // Decrement count and quit thread
       do {
         state_old = state_new = threads_state;
@@ -645,6 +671,24 @@ static int plugin_init(MYSQL_PLUGIN plugin_ref) {
     }
   }
 
+#ifdef epoll_params
+  if (debug_file) {
+    struct epoll_params params;
+    /* Code to show how to retrieve the current settings */
+
+    memset(&params, 0, sizeof(struct epoll_params));
+
+    if (ioctl(thread_pools[0].epfd, EPIOCGPARAMS, &params) == -1)
+      std::raise(SIGABRT);
+
+    /* params struct now contains the current parameters */
+
+    fprintf(debug_file, "epoll usecs: %lu\n", params.busy_poll_usecs);
+    fprintf(debug_file, "epoll packet budget: %u\n", params.busy_poll_budget);
+    fprintf(epoll_params), "epoll prefer busy poll: %u\n", params.prefer_busy_poll);
+  }
+#endif
+
   if (my_connection_handler_set(&conn_handler, &thd_event))
     goto errhandle;
   return 0;
@@ -660,6 +704,10 @@ static int plugin_deinit(MYSQL_PLUGIN plugin_ref [[maybe_unused]]) {
   // free the thread pools
   delete[] thread_pools;
   (void)my_connection_handler_reset();
+
+  if (debug_file)) {
+    flose(debug_file);
+  }
   return 0;
 }
 
