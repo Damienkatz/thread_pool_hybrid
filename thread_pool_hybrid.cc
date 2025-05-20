@@ -256,7 +256,7 @@ use_connection_per_thread:
       } // else fall through to processing the connection
       }
 do_command:
-      if (thd_connection_alive(thd) && !do_command(thd)) {
+      if (!do_command(thd)) {
         // successfully processed. 
         if (tp.use_connection_per_thread()) {
           // We have enough threads available to go the
@@ -632,7 +632,7 @@ static void Thd_wait_end(THD *thd) {
 
 static void Post_kill_notification(THD *thd) {
   if (thd_get_scheduler_data(thd)) {
-    // There is scehdule_data. its one of ours, shutdown the fd but don't close,
+    // There is scehduler_data. its one of ours, shutdown the fd but don't close,
     // that way we get an epoll or poll event and clean it up
     thd_close_connection(thd);
   }
