@@ -9,6 +9,7 @@
 #include <sys/eventfd.h>
 #include <sys/sysinfo.h>
 #include <sys/ioctl.h>
+#include <inttypes.h>
 
 #include "mysql/plugin.h"
 #include "my_thread.h"
@@ -80,25 +81,26 @@ static MYSQL_SYSVAR_BOOL(
   nullptr, /* update func*/
   true);      /* default*/
 
-static char debug_out_file[PATH_MAX] = "\0";
-static char* debug_out_file2 = (char*)debug_out_file;
+static char* debug_out_file = nullptr;
 static FILE *debug_file = nullptr;
-static void update_debug_out_file(MYSQL_THD, SYS_VAR *var [[maybe_unused]], void *var_ptr,
-                                  const void *save [[maybe_unused]]) {
-  char *in = (char *)var_ptr;
-  FILE *debug_file_in = fopen(in, "w");
+
+static void update_debug_out_file(MYSQL_THD, SYS_VAR *var [[maybe_unused]],
+                                  void *var_ptr, const void *save) {
+  const char *in = *static_cast<const char **>(const_cast<void *>(save));
+  FILE *debug_file_in = fopen(in, "a");
   if (debug_file_in != NULL) {
     if (debug_file)
       fclose(debug_file);
     debug_file = debug_file_in;
-    strncpy(debug_out_file, in, sizeof(debug_out_file));
-    debug_out_file[sizeof(debug_out_file) - 1] = '\0'; // Ensure null termination
+    setbuf(debug_file, NULL);
+    *static_cast<const char **>(var_ptr) =
+        *static_cast<const char **>(const_cast<void *>(save));
   }
 }
 
 static MYSQL_SYSVAR_STR(
-  debug_out_file, debug_out_file2,
-  PLUGIN_VAR_OPCMDARG,
+  debug_out_file, debug_out_file,
+  PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_MEMALLOC,
   "Enable debug messages output to filename.",
   nullptr, /* check func*/
   update_debug_out_file, /* update func*/
@@ -112,6 +114,22 @@ static SYS_VAR *system_variables[] = {
     MYSQL_SYSVAR(debug_out_file),
     nullptr};
 
+#ifdef NDEBUG
+#define debug_out(tp, ...)
+#else
+atomic<size_t> line_number = 0;
+#define debug_out(tp, ...) \
+if (debug_file) { \
+  char b[82] = {0}; \
+  Thread_pool::Threads_state s = tp->threads_state; \
+  size_t line = line_number++; \
+  snprintf(b, sizeof(b), "%zu %d [%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 "] ", \
+    line, gettid(), s.count, s.epoll_waiting, s.lock_waiting, s.connection_count); \
+  snprintf(b + strlen(b), sizeof(b) - strlen(b), __VA_ARGS__); \
+  fprintf(debug_file, "%s\n", b); \
+}
+#endif
+
 /******************************************************************************
  * Thread_pool manages a collection of threads. Threads are per connection
  * until max_threads_per_pool reached in which case the threads use
@@ -120,7 +138,8 @@ static SYS_VAR *system_variables[] = {
 
 struct Thread_pool {
   int epfd = -1;                  /* epoll fd used by pool */
-  int evfd_epoll = -1;            /* eventfd to shutdown the threads in epoll */
+  int pipe_read = -1;             /* used to communicate new connection, or pool shutdown */
+  int pipe_write = -1;            /* used to communicate new connection, or pool shutdown */
   int evfd_poll = -1;             /* eventfd to shutdown the threads in poll 
                                      or convert them to epoll */
 
@@ -152,10 +171,10 @@ struct Thread_pool {
  ******************************************************************************/
 
 struct Client_event {
-  Thread_pool &tp;
+  Thread_pool *tp;
   THD *thd;
 
-  Client_event(Thread_pool &tp_in, THD *thd_in)
+  Client_event(Thread_pool *tp_in, THD *thd_in)
       : tp(tp_in), thd(thd_in) {
   }
 
@@ -164,42 +183,44 @@ struct Client_event {
     close_connection(thd, 0, false, false);
     Thread_pool::Threads_state state_old, state_new;
     do {
-      state_old = state_new = tp.threads_state;
+      state_old = state_new = tp->threads_state;
       state_new.connection_count--;
-    } while (!tp.threads_state.compare_exchange_weak(state_old, state_new));
+    } while (!tp->threads_state.compare_exchange_weak(state_old, state_new));
 
     destroy_thd(thd, false);
     dec_connection_count();
   }
 
-  void readd_to_epoll() {
+  void add_to_epoll(bool is_new_thd) {
     epoll_event evt;
     evt.events = EPOLLIN | EPOLLRDHUP | EPOLLONESHOT;
     evt.data.ptr = thd;
-    if (epoll_ctl(tp.epfd, EPOLL_CTL_MOD, thd_get_fd(thd), &evt)) {
+    int op = is_new_thd ? EPOLL_CTL_ADD : EPOLL_CTL_MOD;
+    if (epoll_ctl(tp->epfd, op, thd_get_fd(thd), &evt)) {
       my_plugin_log_message(&thread_pool_hybrid_plugin, MY_ERROR_LEVEL,
-        "unexpected errno %d from epoll_ctl(EPOLL_CTL_MOD,...). raising SIGABRT", errno);
+        "unexpected errno %d from epoll_ctl(EPOLL_CTL_ADD,...). raising SIGABRT", errno);
       std::raise(SIGABRT);
     }
   }
 
   void del_from_epoll() {
-    if (epoll_ctl(tp.epfd, EPOLL_CTL_DEL, thd_get_fd(thd), nullptr)) {
-      // normal when fd closed. clean up code will free the
-      // Client_event
+    if (epoll_ctl(tp->epfd, EPOLL_CTL_DEL, thd_get_fd(thd), nullptr)) {
+      my_plugin_log_message(&thread_pool_hybrid_plugin, MY_ERROR_LEVEL,
+        "unexpected errno %d from epoll_ctl(EPOLL_CTL_DEL,...). raising SIGABRT", errno);
+      std::raise(SIGABRT);
     }
   }
 
-  void process(bool needs_handshake) {
+  void process(bool is_new_thd) {
     char thread_top = 0;
-    if (needs_handshake) {
+    if (is_new_thd) {
       thd_init(thd, &thread_top);
       if (!thd_prepare_connection(thd)) {
-        if (tp.use_connection_per_thread()) {
+        if (tp->use_connection_per_thread()) {
           // Successful handshake, we have enough threads available to
           // go the use_connection_per_thread path. If we should be in epoll
           // we'll get an event through evfd_poll and kick us out into epoll.
-          // So it's ok that the call to tp.use_connection_per_thread()
+          // So it's ok that the call to tp->use_connection_per_thread()
           // can switch to false before we call poll.
           goto use_connection_per_thread;
         } else {
@@ -209,13 +230,12 @@ struct Client_event {
           // But it's not ok to be in poll when we should be epoll, because
           // only the client event for the specifc connection can fire and
           // wake us up.
-          readd_to_epoll();
+          add_to_epoll(is_new_thd);
           return;
         }
       }
       // failed handshake, this is the error path.
       increment_aborted_connects();
-      del_from_epoll();
       clean_up_thd();
       return;
     } else {
@@ -229,7 +249,8 @@ use_connection_per_thread:
       // Here we wait for the descriptor to become read ready or transition
       // to epoll mode
       pollfd pfd[] = {{thd_get_fd(thd), POLLIN | POLLRDHUP, 0},
-                      {tp.evfd_poll, POLLIN | POLLRDHUP, 0}};
+                      {tp->evfd_poll, POLLIN | POLLRDHUP, 0}};
+      debug_out(tp, "Waiting in poll");
       int res = poll(pfd, 2, -1);
       if (res == -1) {
         if (errno == EINTR) {
@@ -245,24 +266,26 @@ use_connection_per_thread:
       if (pfd[1].revents != 0) {
         // clear the event, we get this when being notified to switch to epoll
         uint64_t val;
-        if (read(tp.evfd_poll, &val, sizeof(val))) {
+        if (read(tp->evfd_poll, &val, sizeof(val))) {
           // placate compiler -Wunused-result
         }
+        
+        debug_out(tp, "Got `wait in epoll` notification");
       }
       if (pfd[0].revents == 0) {
           // only got the previous switch to epoll event. So do the switch
-          readd_to_epoll();
+          add_to_epoll(is_new_thd);
           return;
       } // else fall through to processing the connection
       }
 do_command:
       if (!do_command(thd)) {
         // successfully processed. 
-        if (tp.use_connection_per_thread()) {
+        if (tp->use_connection_per_thread()) {
           // We have enough threads available to go the
           // use_connection_per_thread path. If we should be in epoll
           // we'll get an event through evfd_poll and kick us out into epoll.
-          // So it's ok that the call to tp.use_connection_per_thread()
+          // So it's ok that the call to tp->use_connection_per_thread()
           // can switch to false before we call poll.
           goto use_connection_per_thread;
         } else {
@@ -272,12 +295,13 @@ do_command:
           // But it's not ok to be in poll when we should be epoll, because
           // only the client event for the specifc connection can fire and
           // wake us up.
-          readd_to_epoll();
+          add_to_epoll(is_new_thd);
           return;
         }
       }
       // this is the error/stop path
-      del_from_epoll();
+      if (!is_new_thd)
+        del_from_epoll();
       end_connection(thd);
     }
     clean_up_thd();
@@ -293,9 +317,11 @@ Thread_pool::Thread_pool() : shutdown(false) {
 }
 
 Thread_pool::~Thread_pool() {
-  epoll_ctl(epfd, EPOLL_CTL_DEL, evfd_epoll, NULL);
+  if (epfd != -1 && pipe_read != -1)
+    epoll_ctl(epfd, EPOLL_CTL_DEL, pipe_read, NULL);
   if (evfd_poll >= 0) close(evfd_poll);
-  if (evfd_epoll >= 0) close(evfd_epoll);
+  if (pipe_write >= 0) close(pipe_write);
+  if (pipe_read >= 0) close(pipe_read);
   if (epfd >= 0) close(epfd);
 }
 
@@ -307,8 +333,14 @@ bool Thread_pool::use_connection_per_thread() {
 int Thread_pool::initialize() {
   if ((epfd = epoll_create1(EPOLL_CLOEXEC)) == -1)
     return errno;
-  
-  if ((evfd_epoll = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)) == -1)
+
+  int pipes[2] = {-1, -1};
+  if (pipe2(pipes, O_CLOEXEC | O_DIRECT) == -1)
+    return errno;
+  pipe_read = pipes[0];
+  pipe_write = pipes[1];
+
+  if (fcntl(pipe_read, F_SETFL, O_NONBLOCK) == -1)
     return errno;
 
   if ((evfd_poll = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK | EFD_SEMAPHORE)) == -1)
@@ -316,8 +348,8 @@ int Thread_pool::initialize() {
   
   epoll_event epev;
   epev.events = EPOLLIN;
-  epev.data.ptr = nullptr;
-  if (epoll_ctl(epfd, EPOLL_CTL_ADD, evfd_epoll, &epev) == -1)
+  epev.data.ptr = this;
+  if (epoll_ctl(epfd, EPOLL_CTL_ADD, pipe_read, &epev) == -1)
     return errno;
 
   for (size_t i = 0; i < min_waiting_threads_per_pool; i++) {
@@ -347,15 +379,21 @@ void Thread_pool::shutdown_threads() {
   if (write(evfd_poll, &val, sizeof(val))) {
     // placate compiler -Wunused-result
   }
-  // now signal to threads in epoll to shutdown
-  // we can have way more than max_threads_per_pool waiting in epoll,
-  // due to locking (see thd_wait_begin) but because none
-  // of the client threads ever clear the event, any thread that
-  // calls epoll_wait will get the event.
-  if (write(evfd_epoll, &val, sizeof(val))) {
+
+  if (fcntl(pipe_write, F_SETFL, O_NONBLOCK)) {
     // placate compiler -Wunused-result
   }
+  
   while (threads_state.load().count) {
+    // now signal to threads in epoll to shutdown
+    // we can have way more than max_threads_per_pool waiting in epoll,
+    // due to locking (see thd_wait_begin) but because none
+    // of the client threads ever clear the event, any thread that
+    // calls epoll_wait will get the event.
+    val = 1;
+    if (write(pipe_write, &val, sizeof(val))) {
+      // placate compiler -Wunused-result
+    }
     if (threads_state.load().count == 1) {
       // Last thread might be this thread doing the teardown. if so skip it.
       // Thread will shutdown once this request is complete.
@@ -363,8 +401,7 @@ void Thread_pool::shutdown_threads() {
       if (thd) {
         // our requesting thd can't be waiting on a lock so no need to decode
         // the ptr.
-        Thread_pool &tp = *(Thread_pool *)thd_get_scheduler_data(thd);
-        if (&tp == this)
+        if (this == (Thread_pool *)thd_get_scheduler_data(thd))
           // its our thread still alive. return;
           return;
       }
@@ -390,11 +427,15 @@ void* Thread_pool::thread_start(void *p) {
       "Thread_pool thread failed in my_thread_init()");
     std::raise(SIGABRT);
   }
+
+  debug_out(tp, "thread birthed");
   my_thread_self_setname("tp_hybrid");
 
   tp->thread_loop();
 
   my_thread_end();
+
+  debug_out(tp, "thread died");
   return nullptr;
 }
 
@@ -424,6 +465,7 @@ void Thread_pool::thread_loop() {
       return;
 
 wait_again:
+    debug_out(this, "Waiting in epoll");
     int cnt = epoll_wait(epfd, &evt, 1, -1);
     if (cnt == -1) {
       if (errno == EINTR) {
@@ -437,9 +479,21 @@ wait_again:
     }
     if (shutdown.load()) {
       // this is our server shutdown/plugin-unload event.
-      // Don't read from epfd_epoll and any thread that calls
-      // epoll_wait will get this event
-      // Decrement count and quit thread
+    
+      // first clear out any unprocessed Channel_infos
+      Channel_info *ci;
+      while (read(pipe_read, &ci, sizeof(ci)) == sizeof(ci)) {
+        if ((uintptr_t)ci != 1) {
+          destroy_channel_info(ci);
+          increment_aborted_connects();
+          dec_connection_count();
+
+          do {
+            state_old = state_new = threads_state;
+            state_new.connection_count--;
+          } while (!threads_state.compare_exchange_weak(state_old, state_new));
+        }
+      }
       do {
         state_old = state_new = threads_state;
         state_new.count--;
@@ -471,10 +525,35 @@ wait_again:
         std::raise(SIGABRT);
       }
     }
-    // only get EPOLLOUT on new connections, it indicates
-    // we need to handshake the client
-    bool needs_handshake = (EPOLLOUT & evt.events) != 0;
-    Client_event(*this, (THD *)evt.data.ptr).process(needs_handshake);
+
+    THD *thd;
+    bool is_new_thd;
+    if ((Thread_pool *)evt.data.ptr == this) {
+      // this means it's a new connection. Extract the Channel_info ptr
+      // and turn it into a THD ptr
+      Channel_info *ci;
+      if (read(pipe_read, &ci, sizeof(ci)) == -1) {
+        debug_out(this, "Got empty notification from pipe_read");
+        continue;
+      }
+      thd = create_thd(ci);
+      is_new_thd = true;
+      destroy_channel_info(ci);
+      if (thd == nullptr) {
+        increment_aborted_connects();
+        dec_connection_count();
+        do {
+          state_old = state_new = threads_state;
+          state_new.connection_count--;
+        } while (!threads_state.compare_exchange_weak(state_old, state_new));
+        continue;
+      }
+    } else {
+      thd = (THD *)evt.data.ptr;
+      is_new_thd = false;
+    }
+
+    Client_event(this, thd).process(is_new_thd);
   }
 }
 
@@ -485,7 +564,7 @@ static atomic<size_t> next_thread_pool;
  * Connection_handler_functions
  ******************************************************************************/
 
-static bool add_connection(Channel_info *channel_info) {
+static bool add_connection(Channel_info *ci) {
   // first assign this connection to a thread_pool
   size_t next;
   size_t nextnext;
@@ -495,41 +574,25 @@ static bool add_connection(Channel_info *channel_info) {
      if (nextnext == total_thread_pools) nextnext = 0;
   } while (!next_thread_pool.compare_exchange_weak(next, nextnext));
 
-  Thread_pool &tp = thread_pools[next];
-
-  THD *thd = create_thd(channel_info);
-  if (thd == nullptr) {
-    increment_aborted_connects();
-    dec_connection_count();
-    return true;
-  }
-  destroy_channel_info(channel_info);
-
+  Thread_pool *tp = &thread_pools[next];
   Thread_pool::Threads_state state_old, state_new;
   do {
-    state_old = state_new = tp.threads_state;
+    state_old = state_new = tp->threads_state;
     state_new.connection_count++; // decremented in Client_event::clean_up_thd()
-  } while (!tp.threads_state.compare_exchange_weak(state_old, state_new));
+  } while (!tp->threads_state.compare_exchange_weak(state_old, state_new));
   
   if (enable_connection_per_thread_mode &&
       state_new.connection_count == max_threads_per_pool + 1) {
     // signal switch to epoll to any threads waiting in poll
-    uint64_t val = state_new.connection_count;
-    if (write(tp.evfd_poll, &val, sizeof(val))) {
+    uint64_t val = max_threads_per_pool;
+    if (write(tp->evfd_poll, &val, sizeof(val))) {
       // placate compiler -Wunused-result
     }
   }
-
-  thd_set_scheduler_data(thd, &tp);
-  epoll_event evt;
-  evt.events = EPOLLOUT | EPOLLRDHUP | EPOLLONESHOT;
-  evt.data.ptr = thd;
-  if (epoll_ctl(tp.epfd, EPOLL_CTL_ADD, thd_get_fd(thd), &evt)) {
-    my_plugin_log_message(&thread_pool_hybrid_plugin, MY_ERROR_LEVEL,
-      "Error %d in epoll_ctl(tp.epfd, EPOLL_CTL_ADD, ...)", errno);
-      Client_event event(tp, thd);
-      event.clean_up_thd();
-      return true;
+  
+  if (write(tp->pipe_write, &ci, sizeof(ci)) != sizeof(ci)) {
+    // this should not happen
+    std::raise(SIGABRT);
   }
 
   return false;
@@ -619,13 +682,13 @@ static void Thd_wait_end(THD *thd) {
 
   if (is_in_lock) {
     // strip out the is_in_lock bit
-    Thread_pool &tp = *(Thread_pool*)(encoded_ptr & ~(uintptr_t)1);
-    thd_set_scheduler_data(thd, &tp);
+    Thread_pool *tp = (Thread_pool*)(encoded_ptr & ~(uintptr_t)1);
+    thd_set_scheduler_data(thd, tp);
     Thread_pool::Threads_state state_old, state_new;
     do {
-      state_old = state_new = tp.threads_state;
+      state_old = state_new = tp->threads_state;
       state_new.lock_waiting--;
-    } while (!tp.threads_state.compare_exchange_weak(state_old, state_new));
+    } while (!tp->threads_state.compare_exchange_weak(state_old, state_new));
     
   }
 }
