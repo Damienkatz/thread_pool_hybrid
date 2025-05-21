@@ -335,8 +335,9 @@ int Thread_pool::initialize() {
     return errno;
   pipe_read = pipes[0];
   pipe_write = pipes[1];
-
-  if (fcntl(pipe_read, F_SETFL, O_NONBLOCK) == -1)
+  
+  int flags = fcntl(pipe_write, F_GETFL, 0);
+  if (fcntl(pipe_read, F_SETFL, flags | O_NONBLOCK) == -1)
     return errno;
 
   if ((evfd_poll = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK | EFD_SEMAPHORE)) == -1)
@@ -375,10 +376,9 @@ void Thread_pool::shutdown_threads() {
   if (write(evfd_poll, &val, sizeof(val))) {
     // placate compiler -Wunused-result
   }
-
-  if (fcntl(pipe_write, F_SETFL, O_NONBLOCK)) {
-    // placate compiler -Wunused-result
-  }
+  int flags = fcntl(pipe_write, F_GETFL, 0);
+  if (fcntl(pipe_write, F_SETFL, flags | O_NONBLOCK))
+    std::raise(SIGTERM);
   
   while (threads_state.load().count) {
     // now signal to threads in epoll to shutdown
