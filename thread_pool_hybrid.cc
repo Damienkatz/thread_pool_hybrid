@@ -201,15 +201,15 @@ struct Client_event {
   }
 
   void del_from_epoll() {
-    if (epoll_ctl(tp->epfd, EPOLL_CTL_DEL, thd_get_fd(thd), nullptr)) {
-      my_plugin_log_message(&thread_pool_hybrid_plugin, MY_ERROR_LEVEL,
-        "unexpected errno %d from epoll_ctl(EPOLL_CTL_DEL,...). raising SIGABRT", errno);
-      std::raise(SIGABRT);
-    }
+    epoll_ctl(tp->epfd, EPOLL_CTL_DEL, thd_get_fd(thd), nullptr);
   }
 
-  void process(bool is_new_thd) {
+  void process(bool is_new_thd, int epoll_events) {
     char thread_top = 0;
+    if ((epoll_events & EPOLLIN) == 0) {
+        debug_out(tp, "epoll got an error or hang up %02X", epoll_events);
+      goto error;
+    }
     if (is_new_thd) {
       thd_init(thd, &thread_top);
       if (!thd_prepare_connection(thd)) {
@@ -236,7 +236,7 @@ struct Client_event {
       clean_up_thd();
       return;
     } else {
-      // we get here from epoll_wait having done the handshake previously, 
+      // we get here having done the handshake, then epoll_wait.
       // and now to process a command,
       thd_set_thread_stack(thd, &thread_top);
       thd_store_globals(thd);
@@ -245,8 +245,8 @@ use_connection_per_thread:
       {
       // Here we wait for the descriptor to become read ready or transition
       // to epoll mode
-      pollfd pfd[] = {{thd_get_fd(thd), POLLIN | POLLRDHUP, 0},
-                      {tp->evfd_poll, POLLIN | POLLRDHUP, 0}};
+      pollfd pfd[] = {{thd_get_fd(thd), POLLIN, 0},
+                      {tp->evfd_poll, POLLIN, 0}};
       debug_out(tp, "Waiting in poll");
       int res = poll(pfd, 2, -1);
       if (res == -1) {
@@ -266,22 +266,17 @@ use_connection_per_thread:
         if (read(tp->evfd_poll, &val, sizeof(val))) {
           // placate compiler -Wunused-result
         }
-        
-        debug_out(tp, "Got `wait in epoll` notification");
       }
       if (pfd[0].revents == 0) {
-        // only got the previous switch to epoll event. So do the switch
+        debug_out(tp, "Got `switch to epoll` notification");
+        // We only got the switch to epoll event. So do the switch
         add_to_epoll(is_new_thd);
         return;
-      } else if ((pfd[0].revents & EPOLLIN) == 0) {
-        // We got an error or closed socket. So close our end.
-        thd_close_connection(thd);
-        if (!is_new_thd)
-          del_from_epoll();
-        end_connection(thd);
-        clean_up_thd();
-        return;
-      }
+      } else if ((pfd[0].revents & POLLIN) == 0) {
+        // we got a client error or a hang up.
+        debug_out(tp, "poll got an error or hang up %02X", (int)pfd[0].revents);
+        goto error;
+      } // else fall through to processing the connection
       }
 do_command:
       if (!do_command(thd)) {
@@ -304,6 +299,7 @@ do_command:
           return;
         }
       }
+error:
       // this is the error/stop path
       if (!is_new_thd)
         del_from_epoll();
@@ -504,6 +500,7 @@ wait_again:
         std::raise(SIGABRT);
       }
     }
+    debug_out(this, "Awoken from epoll_wait");
   
     if (evt.data.u64 == 1) {
       // this means we should die aas it's the shutdown or unload event.
@@ -564,12 +561,13 @@ wait_again:
         continue;
       }
       thd_set_scheduler_data(thd, this);
+      evt.events = EPOLLIN;
     } else {
       thd = (THD *)evt.data.ptr;
       is_new_thd = false;
     }
 
-    Client_event(this, thd).process(is_new_thd);
+    Client_event(this, thd).process(is_new_thd, evt.events);
   }
 }
 
