@@ -114,9 +114,6 @@ static SYS_VAR *system_variables[] = {
     MYSQL_SYSVAR(debug_out_file),
     nullptr};
 
-#ifdef NDEBUG
-#define debug_out(tp, ...)
-#else
 atomic<size_t> line_number = 0;
 #define debug_out(tp, ...) \
 if (debug_file) { \
@@ -128,7 +125,6 @@ if (debug_file) { \
   snprintf(b + strlen(b), sizeof(b) - strlen(b), __VA_ARGS__); \
   fprintf(debug_file, "%s\n", b); \
 }
-#endif
 
 /******************************************************************************
  * Thread_pool manages a collection of threads. Threads are per connection
