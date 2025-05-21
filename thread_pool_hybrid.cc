@@ -190,7 +190,7 @@ struct Client_event {
 
   void add_to_epoll(bool is_new_thd) {
     epoll_event evt;
-    evt.events = EPOLLIN | EPOLLRDHUP | EPOLLONESHOT;
+    evt.events = EPOLLIN | EPOLLONESHOT;
     evt.data.ptr = thd;
     int op = is_new_thd ? EPOLL_CTL_ADD : EPOLL_CTL_MOD;
     if (epoll_ctl(tp->epfd, op, thd_get_fd(thd), &evt)) {
@@ -270,10 +270,18 @@ use_connection_per_thread:
         debug_out(tp, "Got `wait in epoll` notification");
       }
       if (pfd[0].revents == 0) {
-          // only got the previous switch to epoll event. So do the switch
-          add_to_epoll(is_new_thd);
-          return;
-      } // else fall through to processing the connection
+        // only got the previous switch to epoll event. So do the switch
+        add_to_epoll(is_new_thd);
+        return;
+      } else if ((pfd[0].revents & EPOLLIN) == 0) {
+        // We got an error or closed socket. So close our end.
+        thd_close_connection(thd);
+        if (!is_new_thd)
+          del_from_epoll();
+        end_connection(thd);
+        clean_up_thd();
+        return;
+      }
       }
 do_command:
       if (!do_command(thd)) {
