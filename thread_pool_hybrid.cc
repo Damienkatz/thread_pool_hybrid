@@ -138,6 +138,7 @@ struct Thread_pool {
   int pipe_write = -1;            /* used to communicate new connection, or pool shutdown */
   int evfd_poll = -1;             /* eventfd to shutdown the threads in poll 
                                      or convert them to epoll */
+  int evfd_epoll = -1;             /* eventfd to shutdown the threads in epoll */
 
   struct Threads_state {
     uint32_t count = 0;           /* total threads in Thread_pool */
@@ -154,7 +155,7 @@ struct Thread_pool {
   ~Thread_pool();
 
   int initialize();
-  void shutdown_threads();
+  void shutdown_pool();
   int spawn_thread();
   bool use_connection_per_thread();
 
@@ -315,6 +316,8 @@ Thread_pool::Thread_pool() : shutdown(false) {
 Thread_pool::~Thread_pool() {
   if (epfd != -1 && pipe_read != -1)
     epoll_ctl(epfd, EPOLL_CTL_DEL, pipe_read, NULL);
+  if (epfd != -1 && evfd_epoll != -1)
+    epoll_ctl(epfd, EPOLL_CTL_DEL, evfd_epoll, NULL);
   if (evfd_poll >= 0) close(evfd_poll);
   if (pipe_write >= 0) close(pipe_write);
   if (pipe_read >= 0) close(pipe_read);
@@ -339,11 +342,19 @@ int Thread_pool::initialize() {
   int flags = fcntl(pipe_write, F_GETFL, 0);
   if (fcntl(pipe_read, F_SETFL, flags | O_NONBLOCK) == -1)
     return errno;
-
+  
+  if ((evfd_epoll = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK | EFD_SEMAPHORE)) == -1)
+    return errno;
+    
   if ((evfd_poll = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK | EFD_SEMAPHORE)) == -1)
     return errno;
   
   epoll_event epev;
+  epev.events = EPOLLIN;
+  epev.data.u64 = 1;
+  if (epoll_ctl(epfd, EPOLL_CTL_ADD, evfd_epoll, &epev) == -1)
+    return errno;
+  
   epev.events = EPOLLIN;
   epev.data.ptr = this;
   if (epoll_ctl(epfd, EPOLL_CTL_ADD, pipe_read, &epev) == -1)
@@ -368,7 +379,7 @@ int Thread_pool::initialize() {
   return 0;
 }
 
-void Thread_pool::shutdown_threads() {
+void Thread_pool::shutdown_pool() {
   shutdown.store(true);
   // signal to any threads in poll to shutdown.
   // we can't have more than max_threads_per_pool in poll
@@ -376,20 +387,32 @@ void Thread_pool::shutdown_threads() {
   if (write(evfd_poll, &val, sizeof(val))) {
     // placate compiler -Wunused-result
   }
-  int flags = fcntl(pipe_write, F_GETFL, 0);
-  if (fcntl(pipe_write, F_SETFL, flags | O_NONBLOCK))
-    std::raise(SIGTERM);
-  
+
+  // clear out any unprocessed Channel_infos
+  Channel_info *ci;
+  while (read(pipe_read, &ci, sizeof(ci)) == sizeof(ci)) {
+    destroy_channel_info(ci);
+    increment_aborted_connects();
+    dec_connection_count();
+
+    Threads_state state_old, state_new;
+    do {
+      state_old = state_new = threads_state;
+      state_new.connection_count--;
+    } while (!threads_state.compare_exchange_weak(state_old, state_new));
+  }
+
+  // now signal to threads in epoll to shutdown
+  // we can have way more than max_threads_per_pool waiting in epoll,
+  // due to locking (see thd_wait_begin) but because none
+  // of the client threads ever clear the 1 event, any thread that
+  // calls epoll_wait will get the event.
+  val = 1;
+  if (write(evfd_epoll, &val, sizeof(val))) {
+    // placate compiler -Wunused-result
+  }
   while (threads_state.load().count) {
-    // now signal to threads in epoll to shutdown
-    // we can have way more than max_threads_per_pool waiting in epoll,
-    // due to locking (see thd_wait_begin) but because none
-    // of the client threads ever clear the event, any thread that
-    // calls epoll_wait will get the event.
     val = 1;
-    if (write(pipe_write, &val, sizeof(val))) {
-      // placate compiler -Wunused-result
-    }
     if (threads_state.load().count == 1) {
       // Last thread might be this thread doing the teardown. if so skip it.
       // Thread will shutdown once this request is complete.
@@ -399,7 +422,7 @@ void Thread_pool::shutdown_threads() {
         // the ptr.
         if (this == (Thread_pool *)thd_get_scheduler_data(thd))
           // its our thread still alive. return;
-          return;
+          break;
       }
     }
   }
@@ -444,8 +467,8 @@ void Thread_pool::thread_loop() {
     bool thread_die;
     do {
       state_old = state_new = threads_state;
-      if (state_new.epoll_waiting > min_waiting_threads_per_pool &&
-          state_new.lock_waiting + 1 < state_new.count) {
+      if ((state_new.epoll_waiting > min_waiting_threads_per_pool &&
+          state_new.lock_waiting + 1 < state_new.count)) {
         // state_new.epoll_waiting would become 2 or more than
         // min_waiting_threads_per_pool, also our thread count
         // will still be bigger than the count of lock waiting.
@@ -473,23 +496,10 @@ wait_again:
         std::raise(SIGABRT);
       }
     }
-    if (shutdown.load()) {
-      // this is our server shutdown/plugin-unload event.
-    
-      // first clear out any unprocessed Channel_infos
-      Channel_info *ci;
-      while (read(pipe_read, &ci, sizeof(ci)) == sizeof(ci)) {
-        if ((uintptr_t)ci != 1) {
-          destroy_channel_info(ci);
-          increment_aborted_connects();
-          dec_connection_count();
-
-          do {
-            state_old = state_new = threads_state;
-            state_new.connection_count--;
-          } while (!threads_state.compare_exchange_weak(state_old, state_new));
-        }
-      }
+  
+    if (evt.data.u64 == 1) {
+      // this means we should die aas it's the shutdown or unload event.
+      // Don't clear the event, other threads will want this event too.
       do {
         state_old = state_new = threads_state;
         state_new.count--;
@@ -512,6 +522,7 @@ wait_again:
         spawnthread = false;
       }
     } while (!threads_state.compare_exchange_weak(state_old, state_new));
+  
     if (spawnthread) {
       int res = spawn_thread();
       if (res) {
@@ -544,6 +555,7 @@ wait_again:
         } while (!threads_state.compare_exchange_weak(state_old, state_new));
         continue;
       }
+      thd_set_scheduler_data(thd, this);
     } else {
       thd = (THD *)evt.data.ptr;
       is_new_thd = false;
@@ -597,7 +609,19 @@ static bool add_connection(Channel_info *ci) {
 static void end() {
   // stop all threads
   for (size_t i = 0; i < total_thread_pools; i++)
-    thread_pools[i].shutdown_threads();
+    thread_pools[i].shutdown_pool();
+  // free the mem
+  if (thread_pools)
+    delete[] thread_pools;
+  
+  // null out
+  total_thread_pools = 0;
+  thread_pools = nullptr;
+
+  if (debug_file) {
+    fclose(debug_file);
+    debug_file = nullptr;
+  }
 }
 
 Connection_handler_functions conn_handler = {
@@ -691,7 +715,7 @@ static void Thd_wait_end(THD *thd) {
 
 static void Post_kill_notification(THD *thd) {
   if (thd_get_scheduler_data(thd)) {
-    // There is scehduler_data. its one of ours, shutdown the fd but don't close,
+    // There is scheduler_data. its one of ours, shutdown the fd but don't close,
     // that way we get an epoll or poll event and clean it up
     thd_close_connection(thd);
   }
@@ -714,8 +738,8 @@ static int plugin_init(MYSQL_PLUGIN plugin_ref) {
   if (total_thread_pools == 0)
     total_thread_pools = sysconf(_SC_NPROCESSORS_ONLN);
 
-  if (max_threads_per_pool <= min_waiting_threads_per_pool + 1)
-    min_waiting_threads_per_pool = max_threads_per_pool - 1;
+  if (max_threads_per_pool < min_waiting_threads_per_pool)
+    min_waiting_threads_per_pool = max_threads_per_pool;
 
   thread_pools = new(nothrow) Thread_pool[total_thread_pools];
   if (thread_pools == NULL)
@@ -757,16 +781,8 @@ errhandle:
 }
 
 static int plugin_deinit(MYSQL_PLUGIN plugin_ref [[maybe_unused]]) {
-  // stop all threads
-  for (size_t i = 0; i < total_thread_pools; i++)
-    thread_pools[i].shutdown_threads();
-  // free the thread pools
-  delete[] thread_pools;
+  Thread_pool_hybrid::end();
   (void)my_connection_handler_reset();
-
-  if (debug_file) {
-    fclose(debug_file);
-  }
   return 0;
 }
 
