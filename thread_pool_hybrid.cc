@@ -81,28 +81,53 @@ static MYSQL_SYSVAR_BOOL(
   nullptr, /* update func*/
   true);      /* default*/
 
-static char* debug_out_file = nullptr;
+
+static char *debug_out_file = nullptr;
+
 static FILE *debug_file = nullptr;
 
-static void update_debug_out_file(MYSQL_THD, SYS_VAR *var [[maybe_unused]],
-                                  void *var_ptr, const void *save) {
-  const char *in = *static_cast<const char **>(const_cast<void *>(save));
-  FILE *debug_file_in = fopen(in, "a");
-  if (debug_file_in != NULL) {
+static int check_debug_out_file(MYSQL_THD thd[[maybe_unused]], SYS_VAR *self [[maybe_unused]],
+                                  void *save, struct st_mysql_value *value) {
+  int value_len = 0;
+  if (value == nullptr) return true;
+
+  const char* proposed_debug_file = value->val_str(value, nullptr, &value_len);
+
+  if (proposed_debug_file == nullptr) return true;
+
+  if (strlen(proposed_debug_file) == 0 ) {
+    if (debug_file)
+      fclose(debug_file);
+    debug_file = nullptr;
+    *static_cast<const char **>(save) = proposed_debug_file;
+    return false;
+  }
+
+  if (strlen(proposed_debug_file) > PATH_MAX) return true;
+  
+  FILE *debug_file_in = fopen(proposed_debug_file, "a");
+  if (debug_file_in) {
     if (debug_file)
       fclose(debug_file);
     debug_file = debug_file_in;
     setbuf(debug_file, NULL);
-    *static_cast<const char **>(var_ptr) =
-        *static_cast<const char **>(const_cast<void *>(save));
+    *static_cast<const char **>(save) = proposed_debug_file;
+    return false;
   }
+  return true;
+}
+
+static void update_debug_out_file(MYSQL_THD, SYS_VAR *var [[maybe_unused]],
+                                  void *var_ptr, const void *save) {
+  *static_cast<const char **>(var_ptr) =
+        *static_cast<const char **>(const_cast<void *>(save));
 }
 
 static MYSQL_SYSVAR_STR(
   debug_out_file, debug_out_file,
   PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_MEMALLOC,
   "Enable debug messages output to filename.",
-  nullptr, /* check func*/
+  check_debug_out_file, /* check func*/
   update_debug_out_file, /* update func*/
   "");
 
@@ -206,7 +231,7 @@ struct Client_event {
 
   void process(bool is_new_thd, int epoll_events) {
     char thread_top = 0;
-    if ((epoll_events & EPOLLIN) == 0) {
+    if (epoll_events & (EPOLLHUP | EPOLLERR)){
         debug_out(tp, "epoll got an error or hang up %02X", epoll_events);
       goto error;
     }
@@ -240,6 +265,8 @@ struct Client_event {
       // and now to process a command,
       thd_set_thread_stack(thd, &thread_top);
       thd_store_globals(thd);
+
+      debug_out(tp, "epoll got an event %02X", epoll_events);
       goto do_command;
 use_connection_per_thread:
       {
@@ -272,11 +299,12 @@ use_connection_per_thread:
         // We only got the switch to epoll event. So do the switch
         add_to_epoll(is_new_thd);
         return;
-      } else if ((pfd[0].revents & POLLIN) == 0) {
+      } else if (pfd[0].revents & (POLLHUP | POLLERR)) {
         // we got a client error or a hang up.
         debug_out(tp, "poll got an error or hang up %02X", (int)pfd[0].revents);
         goto error;
       } // else fall through to processing the connection
+      debug_out(tp, "poll got an event %02X", (int)pfd[0].revents);
       }
 do_command:
       if (!do_command(thd)) {
