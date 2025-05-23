@@ -232,8 +232,14 @@ struct Client_event {
   void process(bool is_new_thd, int epoll_events) {
     char thread_top = 0;
     if (epoll_events & (EPOLLHUP | EPOLLERR)){
-        debug_out(tp, "epoll got an error or hang up %02X", epoll_events);
-      goto error;
+      debug_out(tp, "epoll got an error or hang up %02X", epoll_events);
+      int bytes_available;
+      if (ioctl(thd_get_fd(thd), FIONREAD, &bytes_available) == -1) {
+        debug_out(tp, "got an error %d from ioctl(thd_get_fd(thd), FIONREAD,", errno);
+        goto error;
+      } else if (bytes_available == 0) {
+        goto error;
+      } // else we data to read, process normally,
     }
     if (is_new_thd) {
       thd_init(thd, &thread_top);
@@ -302,7 +308,13 @@ use_connection_per_thread:
       } else if (pfd[0].revents & (POLLHUP | POLLERR)) {
         // we got a client error or a hang up.
         debug_out(tp, "poll got an error or hang up %02X", (int)pfd[0].revents);
-        goto error;
+        int bytes_available;
+        if (ioctl(pfd[0].fd, FIONREAD, &bytes_available) == -1) {
+          debug_out(tp, "got an error %d from ioctl(pfd[0].fd, FIONREAD,..)", errno);
+          goto error;
+        } else if (bytes_available == 0) {
+          goto error;
+        } // else we data to read, process normally,
       } // else fall through to processing the connection
       debug_out(tp, "poll got an event %02X", (int)pfd[0].revents);
       }
