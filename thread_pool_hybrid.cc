@@ -97,7 +97,7 @@ static char *debug_out_file = nullptr;
 
 static FILE *debug_file = nullptr;
 
-static int check_debug_out_file(MYSQL_THD thd[[maybe_unused]], SYS_VAR *self [[maybe_unused]],
+static int check_debug_out_file(MYSQL_THD thd[[maybe_unused]], SYS_VAR *self[[maybe_unused]],
                                   void *save, struct st_mysql_value *value) {
   int value_len = 0;
   if (value == nullptr) return true;
@@ -317,9 +317,15 @@ use_connection_per_thread:
         }
       }
       if (pfd[0].revents == 0) {
-        debug_out(tp, "Got `switch to epoll` notification");
-        // We only got the switch to epoll event. So do the switch
-        add_to_epoll(is_new_thd);
+        if (tp->use_connection_per_thread()) {
+          debug_out(tp, "Got old `switch to epoll` notification");
+          // We only got the switch to epoll event. So do the switch
+          // but only if it's still vaild.
+          goto use_connection_per_thread;
+        } else {
+          add_to_epoll(is_new_thd);
+          debug_out(tp, "Got `switch to epoll` notification");
+        }
         return;
       } else if (pfd[0].revents & (POLLHUP | POLLERR)) {
         // we got a client error or a hang up.
@@ -534,14 +540,16 @@ bool Thread_pool::has_thread_timed_out() {
     return_val = false;
     if (state.count > max_threads_per_pool &&
         state.lock_waiting + 1 < state.count) {
-      // we are outside the maximum number of threads, we should die.
+      // we are outside the maximum number of threads,
+      // we should die.
       state.count--;
       state.epoll_waiting--;
       return_val = true;
       continue;
     }
 
-    atomic<time_point> &since = threads_waiting_since[start_of_threads_waiting_since];
+    atomic<time_point> &since = threads_waiting_since[
+                                    start_of_threads_waiting_since];
     time_point now = clock::now();
     auto msecs = chrono::milliseconds{keep_excess_threads_alive_ms};
     if (now - since.load() > msecs) {
@@ -602,7 +610,7 @@ int Thread_pool::spawn_thread() {
 }
 
 void* Thread_pool::thread_start(void *p) {
-  Thread_pool *tp = (Thread_pool*)p;
+  Thread_pool *tp = (Thread_pool *)p;
 
   if (my_thread_init()) {
     my_plugin_log_message(&thread_pool_hybrid_plugin, MY_ERROR_LEVEL,
@@ -625,21 +633,24 @@ void Thread_pool::thread_loop() {
   while (true) {
     epoll_event evt;
     Threads_state state_old, state;
-
+    // add us too state.epoll_waiting
     do {
       state_old = state = threads_state;
       state.epoll_waiting++;
     } while (!threads_state.compare_exchange_weak(state_old, state));
 
-    if (state.epoll_waiting < max_threads_per_pool &&
+    if (state.epoll_waiting <= max_threads_per_pool &&
         state.epoll_waiting > min_waiting_threads_per_pool) {
       // mark our slot current time
-      size_t n = state.epoll_waiting - min_waiting_threads_per_pool;
+      size_t n = state.epoll_waiting - min_waiting_threads_per_pool - 1;
       n = (n + start_of_threads_waiting_since) %
             (max_threads_per_pool - min_waiting_threads_per_pool);
+
       threads_waiting_since[n].store(clock::now());
       
       if (state.epoll_waiting - min_waiting_threads_per_pool == 1) {
+        // we are the first excess thread now waiting, starting the
+        // timer so we can close if unecessary.
         set_time_out_timer();
       }
     }
