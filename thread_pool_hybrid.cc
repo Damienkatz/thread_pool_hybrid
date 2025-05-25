@@ -509,7 +509,8 @@ void Thread_pool::shutdown_pool() {
 }
 
 void Thread_pool::set_time_out_timer() {
-  if (timer_set.load()) {
+  if (timer_set.exchange(true)) {
+    // timer already set
     return;
   }
   // we just transitioned to excess waiting threads. set a timer
@@ -541,9 +542,7 @@ bool Thread_pool::has_thread_timed_out() {
   uint64_t buf;
   if (read(timerfd, &buf, sizeof(buf)) == 0) {
     // another thread responded to the timer already
-    return false;
   }
-  timer_set.store(false);
   bool return_val;
   // see if we've been waiting (as a group) for too long.
   Threads_state state_old, state;
@@ -591,6 +590,8 @@ bool Thread_pool::has_thread_timed_out() {
   }
   // using start, add the current time to it.
   if (state.epoll_waiting > min_waiting_threads_per_pool) {
+    if (timer_set.exchange(true)) 
+      return false;
     auto next_time_out = threads_waiting_since[start].load().time_since_epoch();
     long nsecs = chrono::duration_cast<chrono::nanoseconds>(next_time_out).count();
     time_t secs = (nsecs / 1000000) + (keep_excess_threads_alive_ms / 1000);
@@ -606,6 +607,8 @@ bool Thread_pool::has_thread_timed_out() {
         "timerfd_settimet() returned %d", errno);
       std::raise(SIGABRT);
     }
+  } else {
+    timer_set.store(false);
   }
 
   return return_val;
