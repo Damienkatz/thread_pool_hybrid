@@ -194,7 +194,9 @@ struct Thread_pool {
   atomic<time_point> *threads_waiting_since;
   atomic<size_t> start_of_threads_waiting_since;
 
-  atomic<bool> shutdown;
+  atomic<bool> shutdown = false;
+
+  atomic<bool> timer_set = false;
 
   Thread_pool();
   ~Thread_pool();
@@ -370,7 +372,7 @@ error:
  * Thread_pool member definitions
  ******************************************************************************/
 
-Thread_pool::Thread_pool() : shutdown(false) {
+Thread_pool::Thread_pool() {
 }
 
 Thread_pool::~Thread_pool() {
@@ -389,7 +391,8 @@ Thread_pool::~Thread_pool() {
 }
 
 bool Thread_pool::use_connection_per_thread() {
-  return enable_connection_per_thread_mode &&
+  return !shutdown.load() &&
+          enable_connection_per_thread_mode &&
           threads_state.load().connection_count <= max_threads_per_pool;
 }
 
@@ -432,7 +435,7 @@ int Thread_pool::initialize() {
   if (epoll_ctl(epfd, EPOLL_CTL_ADD, pipe_read, &evt) == -1)
     return errno;
   
-  evt.events = EPOLLIN | EPOLLONESHOT;
+  evt.events = EPOLLIN;
   evt.data.u64 = 2;
   if (epoll_ctl(epfd, EPOLL_CTL_ADD, timerfd, &evt) == -1)
     return errno;
@@ -506,6 +509,9 @@ void Thread_pool::shutdown_pool() {
 }
 
 void Thread_pool::set_time_out_timer() {
+  if (timer_set.load()) {
+    return;
+  }
   // we just transitioned to excess waiting threads. set a timer
   // to see if a thread should die in keep_excess_threads_alive_ms
   struct timespec now;
@@ -527,11 +533,13 @@ void Thread_pool::set_time_out_timer() {
 }
 
 bool Thread_pool::has_thread_timed_out() {
-// Clear the notification event.
+  // Clear the notification event.
   uint64_t buf;
   if (read(timerfd, &buf, sizeof(buf)) == 0) {
-    raise(SIGABRT);
+    // another thread responded to the timer already
+    return false;
   }
+  timer_set.store(false);
   bool return_val;
   // see if we've been waiting (as a group) for too long.
   Threads_state state_old, state;
@@ -562,6 +570,10 @@ bool Thread_pool::has_thread_timed_out() {
     }
   } while (!threads_state.compare_exchange_weak(state_old, state));
 
+  if (return_val) {
+    debug_out(this, "thread has decided to die");
+  }
+
   size_t start_old, start = 0;
   if (return_val) {
     // we should die. compute the new start slot
@@ -575,13 +587,6 @@ bool Thread_pool::has_thread_timed_out() {
   }
 
   if (state.epoll_waiting > min_waiting_threads_per_pool) {
-    // other threads maybe need a notification.
-    epoll_event evt;
-    evt.events = EPOLLIN | EPOLLONESHOT;
-    evt.data.u64 = 2;
-    if (epoll_ctl(epfd, EPOLL_CTL_MOD, timerfd, &evt) == -1)
-      raise(SIGABRT);
-
     auto next_time_out = threads_waiting_since[start].load().time_since_epoch();
     long nsecs = chrono::duration_cast<chrono::nanoseconds>(next_time_out).count();
     time_t secs = (nsecs / 1000000) + (keep_excess_threads_alive_ms / 1000);
