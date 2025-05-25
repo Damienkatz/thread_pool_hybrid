@@ -517,13 +517,17 @@ void Thread_pool::set_time_out_timer() {
   struct timespec now;
   if (clock_gettime(CLOCK_MONOTONIC, &now) == -1)
     std::raise(SIGABRT);
+  
+  now.tv_sec += (keep_excess_threads_alive_ms / 1000);
+  now.tv_nsec += (keep_excess_threads_alive_ms % 1000) * 1000000;
+  now.tv_sec += now.tv_nsec / 1000000;
+  now.tv_nsec = now.tv_nsec % 1000000;
 
   struct itimerspec new_value;
   new_value.it_interval.tv_sec = 0;
   new_value.it_interval.tv_nsec = 0;
-  new_value.it_value.tv_sec = now.tv_sec + (keep_excess_threads_alive_ms / 1000);
-  new_value.it_value.tv_nsec = now.tv_nsec + 
-      (keep_excess_threads_alive_ms % 1000) * 1000000;
+  new_value.it_value.tv_sec = now.tv_sec;
+  new_value.it_value.tv_nsec = now.tv_nsec;
 
   if (timerfd_settime(timerfd, TFD_TIMER_ABSTIME, &new_value, nullptr) == -1) {
     my_plugin_log_message(&thread_pool_hybrid_plugin, MY_ERROR_LEVEL,
@@ -574,7 +578,7 @@ bool Thread_pool::has_thread_timed_out() {
     debug_out(this, "thread has decided to die");
   }
 
-  size_t start_old, start = 0;
+  size_t start_old, start = start_of_threads_waiting_since;
   if (return_val) {
     // we should die. compute the new start slot
     do {
@@ -585,7 +589,7 @@ bool Thread_pool::has_thread_timed_out() {
     } while (!start_of_threads_waiting_since
                 .compare_exchange_weak(start_old, start)); 
   }
-
+  // using start, add the current time to it.
   if (state.epoll_waiting > min_waiting_threads_per_pool) {
     auto next_time_out = threads_waiting_since[start].load().time_since_epoch();
     long nsecs = chrono::duration_cast<chrono::nanoseconds>(next_time_out).count();
