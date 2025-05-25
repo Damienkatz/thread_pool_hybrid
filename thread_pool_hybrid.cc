@@ -542,6 +542,7 @@ bool Thread_pool::has_thread_timed_out() {
   uint64_t buf;
   if (read(timerfd, &buf, sizeof(buf)) == 0) {
     // another thread responded to the timer already
+    return false;
   }
   bool return_val;
   // see if we've been waiting (as a group) for too long.
