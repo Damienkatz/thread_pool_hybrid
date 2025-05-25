@@ -157,8 +157,8 @@ if (debug_file) { \
   char b[82] = {0}; \
   Thread_pool::Threads_state s = tp->threads_state; \
   size_t line = line_number++; \
-  snprintf(b, sizeof(b), "%zu %d [%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 "] ", \
-    line, gettid(), s.count, s.epoll_waiting, s.lock_waiting, s.connection_count); \
+  snprintf(b, sizeof(b), "%zu %d [%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 "] ", \
+    line, gettid(), t->epfd, s.count, s.epoll_waiting, s.lock_waiting, s.connection_count); \
   snprintf(b + strlen(b), sizeof(b) - strlen(b), __VA_ARGS__); \
   fprintf(debug_file, "%s\n", b); \
 }
@@ -653,7 +653,7 @@ void Thread_pool::thread_loop() {
       
       if (state.epoll_waiting - min_waiting_threads_per_pool == 1) {
         // we are the first excess thread now waiting, starting the
-        // timer so we can close if unecessary.
+        // timer so a thread if unecessary.
         set_time_out_timer();
       }
     }
