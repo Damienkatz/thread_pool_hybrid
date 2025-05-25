@@ -158,7 +158,7 @@ if (debug_file) { \
   Thread_pool::Threads_state s = tp->threads_state; \
   size_t line = line_number++; \
   snprintf(b, sizeof(b), "%zu %d [%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 "] ", \
-    line, gettid(), t->epfd, s.count, s.epoll_waiting, s.lock_waiting, s.connection_count); \
+    line, gettid(), tp->epfd, s.count, s.epoll_waiting, s.lock_waiting, s.connection_count); \
   snprintf(b + strlen(b), sizeof(b) - strlen(b), __VA_ARGS__); \
   fprintf(debug_file, "%s\n", b); \
 }
