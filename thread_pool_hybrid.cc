@@ -548,15 +548,17 @@ bool Thread_pool::has_thread_timed_out() {
       continue;
     }
 
-    atomic<time_point> &since = threads_waiting_since[
-                                    start_of_threads_waiting_since];
-    time_point now = clock::now();
-    auto msecs = chrono::milliseconds{keep_excess_threads_alive_ms};
-    if (now - since.load() > msecs) {
-      // we've had threads waiting without work for n msecs. die.
-      state.count--;
-      state.epoll_waiting--;
-      return_val = true;
+    if (state.epoll_waiting > min_waiting_threads_per_pool) {
+      atomic<time_point> &since = threads_waiting_since[
+                                      start_of_threads_waiting_since];
+      time_point now = clock::now();
+      auto msecs = chrono::milliseconds{keep_excess_threads_alive_ms};
+      if (now - since.load() > msecs) {
+        // we've had threads waiting without work for n msecs. die.
+        state.count--;
+        state.epoll_waiting--;
+        return_val = true;
+      }
     }
   } while (!threads_state.compare_exchange_weak(state_old, state));
 
@@ -568,7 +570,8 @@ bool Thread_pool::has_thread_timed_out() {
       start++;
       if (start > max_threads_per_pool - min_waiting_threads_per_pool)
         start = 0;
-    } while (!start_of_threads_waiting_since.compare_exchange_weak(start_old, start)); 
+    } while (!start_of_threads_waiting_since
+                .compare_exchange_weak(start_old, start)); 
   }
 
   if (state.epoll_waiting > min_waiting_threads_per_pool) {
