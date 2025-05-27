@@ -251,7 +251,6 @@ struct Client_event {
         "unexpected errno %d from epoll_ctl(...). raising SIGABRT", errno);
       std::raise(SIGABRT);
     }
-    thd_unlock_data(thd);
   }
 
   void del_from_epoll() {
@@ -577,9 +576,8 @@ bool Thread_pool::has_thread_timed_out() {
     }
   } while (!threads_state.compare_exchange_weak(state_old, state));
 
-  if (return_val) {
+  if (return_val)
     debug_out(this, "thread has decided to die");
-  }
 
   size_t start_old, start = start_of_threads_waiting_since;
   if (return_val) {
