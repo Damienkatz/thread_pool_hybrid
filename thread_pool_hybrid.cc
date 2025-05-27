@@ -152,7 +152,7 @@ static SYS_VAR *system_variables[] = {
 atomic<size_t> line_number = 0;
 #define debug_out(tp, ...) \
 if (debug_file) { \
-  char b[82] = {0}; \
+  char b[100] = {0}; \
   Thread_pool::Threads_state s = tp->threads_state; \
   size_t line = line_number++; \
   snprintf(b, sizeof(b), "%zu %d [%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 "] ", \
@@ -229,6 +229,7 @@ struct Client_event {
   }
 
   void clean_up_thd() {
+    debug_out(tp, "Cleaning up thd with fd %d", thd_get_fd(thd));
     // close the connection, decrement our connection count, destroy the thd
     close_connection(thd, 0, false, false);
     Thread_pool::Threads_state state_old, state;
@@ -259,10 +260,7 @@ struct Client_event {
 
   void process(bool is_new_thd, int epoll_events) {
     char thread_top = 0;
-    if (epoll_events & (EPOLLHUP | EPOLLERR)) {
-        debug_out(tp, "epoll got an error or hang up %02X", epoll_events);
-      goto error;
-    }
+
     if (is_new_thd) {
       thd_init(thd, &thread_top);
       if (!thd_prepare_connection(thd)) {
@@ -295,6 +293,9 @@ struct Client_event {
       thd_store_globals(thd);
 
       debug_out(tp, "epoll got an event %02X", epoll_events);
+      if (epoll_events & (EPOLLHUP | EPOLLERR)) {
+        goto error;
+      }
       goto do_command;
 use_connection_per_thread:
       {
@@ -324,15 +325,15 @@ use_connection_per_thread:
       }
       if (pfd[0].revents == 0) {
         if (tp->use_connection_per_thread()) {
-          debug_out(tp, "Maybe got old `switch to epoll` notification");
           // We only got the switch to epoll event. So do the switch
           // but only if it's still vaild.
+          debug_out(tp, "Maybe got old `switch to epoll` notification");
           goto use_connection_per_thread;
         } else {
           debug_out(tp, "Got `switch to epoll` notification");
           add_to_epoll(is_new_thd);
+          return;
         }
-        return;
       } else if (pfd[0].revents & (POLLHUP | POLLERR)) {
         // we got a client error or a hang up.
         debug_out(tp, "poll got an error or hang up %02X", (int)pfd[0].revents);
@@ -682,6 +683,7 @@ wait_again:
     int cnt = epoll_wait(epfd, &evt, 1, -1);
     if (cnt == -1) {
       if (errno == EINTR) {
+        debug_out(this, "Waiting in epoll interrupted");
         // interrupted, wait again
         goto wait_again;
       } else {
@@ -747,6 +749,7 @@ wait_again:
       }
       is_new_thd = true;
       thd = create_thd(ci);
+
       destroy_channel_info(ci);
       if (thd == nullptr) {
         increment_aborted_connects();
