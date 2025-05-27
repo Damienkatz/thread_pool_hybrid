@@ -523,8 +523,8 @@ void Thread_pool::set_time_out_timer() {
   
   now.tv_sec += (keep_excess_threads_alive_ms / 1000);
   now.tv_nsec += (keep_excess_threads_alive_ms % 1000) * 1000000;
-  now.tv_sec += now.tv_nsec / 1000000;
-  now.tv_nsec = now.tv_nsec % 1000000;
+  now.tv_sec += now.tv_nsec / 1000000000;
+  now.tv_nsec = now.tv_nsec % 1000000000;
 
   struct itimerspec new_value;
   new_value.it_interval.tv_sec = 0;
@@ -537,15 +537,19 @@ void Thread_pool::set_time_out_timer() {
       "timerfd_settimet() returned %d", errno);
     std::raise(SIGABRT);
   }
+  debug_out(this, "Set timer");
 }
 
 bool Thread_pool::has_thread_timed_out() {
   // Clear the notification event.
   uint64_t buf;
   if (read(timerfd, &buf, sizeof(buf)) == 0) {
-    // another thread responded to the timer already
+    debug_out(this, "another thread responded to the timer already");
     return false;
   }
+  debug_out(this, "Checking has_thread_timed_out()");
+  // set that the timer is of, because it is.
+  timer_set.store(false);
   bool return_val;
   // see if we've been waiting (as a group) for too long.
   Threads_state state_old, state;
@@ -590,14 +594,17 @@ bool Thread_pool::has_thread_timed_out() {
     } while (!start_of_threads_waiting_since
                 .compare_exchange_weak(start_old, start)); 
   }
-  // using start, add the current time to it.
+  
   if (state.epoll_waiting > min_waiting_threads_per_pool) {
-    if (timer_set.exchange(true)) 
-      return false;
+    if (timer_set.exchange(true)) {
+      // timer is already on. Return our result.
+      return return_val;
+    }
+    // using start slot time, add the keep_excess_threads_alive_ms to the timer
     auto next_time_out = threads_waiting_since[start].load().time_since_epoch();
     long nsecs = chrono::duration_cast<chrono::nanoseconds>(next_time_out).count();
-    time_t secs = (nsecs / 1000000) + (keep_excess_threads_alive_ms / 1000);
-    nsecs = (nsecs % 1000000) + (keep_excess_threads_alive_ms % 1000) * 1000000;
+    time_t secs = (nsecs / 1000000000) + (keep_excess_threads_alive_ms / 1000);
+    nsecs = (nsecs % 1000000000) + (keep_excess_threads_alive_ms % 1000) * 1000000;
     struct itimerspec  new_value;
     new_value.it_interval.tv_sec = 0;
     new_value.it_interval.tv_nsec = 0;
@@ -609,10 +616,7 @@ bool Thread_pool::has_thread_timed_out() {
         "timerfd_settimet() returned %d", errno);
       std::raise(SIGABRT);
     }
-  } else {
-    timer_set.store(false);
   }
-
   return return_val;
 }
 
