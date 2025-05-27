@@ -549,8 +549,6 @@ bool Thread_pool::has_thread_timed_out() {
     return false;
   }
   debug_out(this, "Checking has_thread_timed_out()");
-  // set that the timer is off, because it is.
-  timer_set.store(false);
   bool return_val;
   // see if we've been waiting (as a group) for too long.
   Threads_state state_old, state;
@@ -597,10 +595,6 @@ bool Thread_pool::has_thread_timed_out() {
   }
   
   if (state.epoll_waiting > min_waiting_threads_per_pool) {
-    if (timer_set.exchange(true)) {
-      // timer is already on. Return our result.
-      return return_val;
-    }
     // using start slot time, add the keep_excess_threads_alive_ms to the timer
     auto next_time_out = threads_waiting_since[start].load().time_since_epoch();
     long nsecs = chrono::duration_cast<chrono::nanoseconds>(next_time_out).count() +
@@ -619,6 +613,11 @@ bool Thread_pool::has_thread_timed_out() {
         "timerfd_settimet() returned %d", errno);
       std::raise(SIGABRT);
     }
+  } else {
+    // no other thread waiting, set timer off
+    // While it's possible other threads are waiting because we are racing them, the next
+    // thread to wait set timerfd_settime and turns the timer_set to true.
+    timer_set.store(false);
   }
   return return_val;
 }
