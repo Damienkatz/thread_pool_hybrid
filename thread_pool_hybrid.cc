@@ -548,7 +548,7 @@ bool Thread_pool::has_thread_timed_out() {
     return false;
   }
   debug_out(this, "Checking has_thread_timed_out()");
-  // set that the timer is of, because it is.
+  // set that the timer is off, because it is.
   timer_set.store(false);
   bool return_val;
   // see if we've been waiting (as a group) for too long.
@@ -602,9 +602,11 @@ bool Thread_pool::has_thread_timed_out() {
     }
     // using start slot time, add the keep_excess_threads_alive_ms to the timer
     auto next_time_out = threads_waiting_since[start].load().time_since_epoch();
-    long nsecs = chrono::duration_cast<chrono::nanoseconds>(next_time_out).count();
-    time_t secs = (nsecs / 1000000000) + (keep_excess_threads_alive_ms / 1000);
-    nsecs = (nsecs % 1000000000) + (keep_excess_threads_alive_ms % 1000) * 1000000;
+    long nsecs = chrono::duration_cast<chrono::nanoseconds>(next_time_out).count() +
+                 keep_excess_threads_alive_ms * 1000000;
+
+    time_t secs = (nsecs / 1000000000);
+    nsecs = (nsecs % 1000000000);
     struct itimerspec  new_value;
     new_value.it_interval.tv_sec = 0;
     new_value.it_interval.tv_nsec = 0;
