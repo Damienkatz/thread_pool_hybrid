@@ -18,4 +18,4 @@ First, compile the plugin and install in to plugin dir
 
 Then, load the plugin into mysql
 
-    mysql> INSTALL PLUGIN THREAD_POOL_HYBRID SONAME 'libthread_pool_hybrid.so';
+    mysql> INSTALL PLUGIN THREAD_POOL_HYBRID SONAME 'thread_pool_hybrid.so';
