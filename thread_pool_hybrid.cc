@@ -72,14 +72,14 @@ static MYSQL_SYSVAR_UINT(
   NULL, NULL, 4, 1, 0xFFFF, 0);
 
 
-static uint64_t keep_excess_threads_alive_ms = 4;
+static uint64_t keep_excess_threads_alive_ms = 0;
 
 static MYSQL_SYSVAR_ULONG(
   keep_excess_threads_alive_ms, keep_excess_threads_alive_ms,
   PLUGIN_VAR_READONLY | PLUGIN_VAR_OPCMDARG,
   "How long, in ms, should an extra thread wait idle before dieing. 0 to"
   " instantly die.",
-  NULL, NULL, 1000, 0, ~0ULL, 0);
+  NULL, NULL, 50, 0, ~0ULL, 0);
 
 static bool enable_connection_per_thread_mode;
 
@@ -156,7 +156,7 @@ if (debug_file) { \
   Thread_pool::Threads_state s = tp->threads_state; \
   size_t line = line_number++; \
   snprintf(b, sizeof(b), "%zu %d [%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 "] ", \
-    line, gettid(), tp->epfd, s.count, s.epoll_waiting, s.lock_waiting, s.connection_count); \
+    line, gettid(), tp->epfd, s.threads, s.epoll_waiting, s.lock_waiting, s.connections); \
   snprintf(b + strlen(b), sizeof(b) - strlen(b), __VA_ARGS__); \
   fprintf(debug_file, "%s\n", b); \
 }
@@ -177,10 +177,10 @@ struct Thread_pool {
   int evfd_epoll = -1;             /* eventfd to shutdown the threads in epoll */
 
   struct Threads_state {
-    uint32_t count = 0;           /* total threads in Thread_pool */
+    uint32_t threads = 0;         /* total threads in Thread_pool */
     uint32_t epoll_waiting = 0;   /* total threads waiting on epoll in Thread_pool */
     uint32_t lock_waiting = 0;    /* total threads waiting on a lock in Thread_pool */
-    uint32_t connection_count = 0;/* total clients connected to the Thread_pool */
+    uint32_t connections = 0;     /* total clients connected to the Thread_pool */
   };
 
   atomic<Threads_state> threads_state;
@@ -191,8 +191,16 @@ struct Thread_pool {
   
   atomic<time_point> *threads_waiting_since;
   atomic<size_t> start_of_threads_waiting_since;
-
   atomic<bool> timer_set = false;
+
+  enum {
+    // These are the values returned in epoll_event.data.u64 by epoll_wait.
+    EVENT_SHUTDOWN = 0,
+    EVENT_TIMER = 1,
+    EVENT_CHANNEL_INFO = 2
+  //EVENT_THD = any value besides those above is a client THD event
+  //            and contains the THD* in epoll_event.data.ptr
+  };
 
   static atomic<bool> shutdown;
   static Thread_pool* thread_pools;
@@ -201,12 +209,15 @@ struct Thread_pool {
   Thread_pool();
   ~Thread_pool();
 
+  bool use_connection_per_thread();
   int initialize();
   void shutdown_pool();
+
+  void incr_epoll_waiting_and_record_wait_start_and_maybe_set_timer();
   int spawn_thread();
-  bool use_connection_per_thread();
-  void set_time_out_timer();
   bool has_thread_timed_out();
+  void decr_epoll_waiting_and_maybe_spawn_thread();
+  THD* get_channel_info_and_turn_into_thd();
 
   static void* thread_start(void*);
   void thread_loop();
@@ -230,12 +241,12 @@ struct Client_event {
 
   void clean_up_thd() {
     debug_out(tp, "Cleaning up thd with fd %d", thd_get_fd(thd));
-    // close the connection, decrement our connection count, destroy the thd
+    // close the connection, decrement our connections, destroy the thd
     close_connection(thd, 0, false, false);
     Thread_pool::Threads_state state_old, state;
     do {
       state_old = state = tp->threads_state;
-      state.connection_count--;
+      state.connections--;
     } while (!tp->threads_state.compare_exchange_weak(state_old, state));
 
     destroy_thd(thd, false);
@@ -327,7 +338,7 @@ use_connection_per_thread:
         if (tp->use_connection_per_thread()) {
           // We only got the switch to epoll event. So do the switch
           // but only if it's still vaild.
-          debug_out(tp, "Maybe got old `switch to epoll` notification");
+          debug_out(tp, "Got old `switch to epoll` notification");
           goto use_connection_per_thread;
         } else {
           debug_out(tp, "Got `switch to epoll` notification");
@@ -398,11 +409,10 @@ Thread_pool::~Thread_pool() {
 bool Thread_pool::use_connection_per_thread() {
   return !shutdown.load() &&
           enable_connection_per_thread_mode &&
-          threads_state.load().connection_count <= max_threads_per_pool;
+          threads_state.load().connections <= max_threads_per_pool;
 }
 
 int Thread_pool::initialize() {
-  // the 0th place in this vector isn't used.
   size_t n = max_threads_per_pool - min_waiting_threads_per_pool;
   threads_waiting_since = new atomic<time_point>[n];
   start_of_threads_waiting_since = n;
@@ -432,17 +442,17 @@ int Thread_pool::initialize() {
   
   epoll_event evt;
   evt.events = EPOLLIN;
-  evt.data.u64 = 0;
+  evt.data.u64 = EVENT_SHUTDOWN;
   if (epoll_ctl(epfd, EPOLL_CTL_ADD, evfd_epoll, &evt) == -1)
     return errno;
   
   evt.events = EPOLLIN;
-  evt.data.u64 = 1;
+  evt.data.u64 = EVENT_CHANNEL_INFO;
   if (epoll_ctl(epfd, EPOLL_CTL_ADD, new_ci_pipe_read, &evt) == -1)
     return errno;
   
   evt.events = EPOLLIN;
-  evt.data.u64 = 2;
+  evt.data.u64 = EVENT_TIMER;
   if (epoll_ctl(epfd, EPOLL_CTL_ADD, timerfd, &evt) == -1)
     return errno;
   
@@ -450,14 +460,14 @@ int Thread_pool::initialize() {
     Threads_state state_old, state;
     do {
       state_old = state = threads_state;
-      state.count++;
+      state.threads++;
     } while (!threads_state.compare_exchange_weak(state_old, state));
     int res = spawn_thread();
     if (res) {
-      // thread not created, decrement count and return error
+      // thread not created, decrement and return error
       do {
         state_old = state = threads_state;
-        state.count--;
+        state.threads--;
       } while (!threads_state.compare_exchange_weak(state_old, state));
       return res;
     }
@@ -483,7 +493,7 @@ void Thread_pool::shutdown_pool() {
     Threads_state state_old, state;
     do {
       state_old = state = threads_state;
-      state.connection_count--;
+      state.connections--;
     } while (!threads_state.compare_exchange_weak(state_old, state));
   }
 
@@ -496,9 +506,9 @@ void Thread_pool::shutdown_pool() {
   if (write(evfd_epoll, &val, sizeof(val))) {
     // placate compiler -Wunused-result
   }
-  while (threads_state.load().count) {
+  while (threads_state.load().threads) {
     val = 1;
-    if (threads_state.load().count == 1) {
+    if (threads_state.load().threads == 1) {
       // Last thread might be this thread doing the teardown. if so skip it.
       // Thread will shutdown once this request is complete.
       THD *thd = thd_get_current_thd();
@@ -511,34 +521,52 @@ void Thread_pool::shutdown_pool() {
   }
 }
 
-void Thread_pool::set_time_out_timer() {
-  if (timer_set.exchange(true)) {
-    // timer already set
-    return;
-  }
-  // we just transitioned to excess waiting threads. set a timer
-  // to see if a thread should die in keep_excess_threads_alive_ms
-  struct timespec now;
-  if (clock_gettime(CLOCK_MONOTONIC, &now) == -1)
-    std::raise(SIGABRT);
-  
-  now.tv_sec += (keep_excess_threads_alive_ms / 1000);
-  now.tv_nsec += (keep_excess_threads_alive_ms % 1000) * 1000000;
-  now.tv_sec += now.tv_nsec / 1000000000;
-  now.tv_nsec = now.tv_nsec % 1000000000;
+void Thread_pool::incr_epoll_waiting_and_record_wait_start_and_maybe_set_timer() {
+  Threads_state state_old, state;
 
-  struct itimerspec new_value;
-  new_value.it_interval.tv_sec = 0;
-  new_value.it_interval.tv_nsec = 0;
-  new_value.it_value.tv_sec = now.tv_sec;
-  new_value.it_value.tv_nsec = now.tv_nsec;
+  // add us to state.epoll_waiting
+  do {
+    state_old = state = threads_state;
+    state.epoll_waiting++;
+  } while (!threads_state.compare_exchange_weak(state_old, state));
 
-  if (timerfd_settime(timerfd, TFD_TIMER_ABSTIME, &new_value, nullptr) == -1) {
-    my_plugin_log_message(&thread_pool_hybrid_plugin, MY_ERROR_LEVEL,
-      "timerfd_settimet() returned %d", errno);
-    std::raise(SIGABRT);
+  if (state.epoll_waiting <= max_threads_per_pool &&
+      state.epoll_waiting > min_waiting_threads_per_pool) {
+    // mark our slot current time
+    size_t n = state.epoll_waiting - min_waiting_threads_per_pool - 1;
+    n = (n + start_of_threads_waiting_since) %
+          (max_threads_per_pool - min_waiting_threads_per_pool);
+
+    threads_waiting_since[n].store(clock::now());
+    
+    if (state.epoll_waiting - min_waiting_threads_per_pool == 1 &&
+        !timer_set.exchange(true)) {
+      // we are the first excess thread now waiting and no timer set, so start
+      // the timer so a thread dies in future if necessary.
+      
+      struct timespec now;
+      if (clock_gettime(CLOCK_MONOTONIC, &now) == -1)
+        std::raise(SIGABRT);
+      
+      now.tv_sec += (keep_excess_threads_alive_ms / 1000);
+      now.tv_nsec += (keep_excess_threads_alive_ms % 1000) * 1000000;
+      now.tv_sec += now.tv_nsec / 1000000000;
+      now.tv_nsec = now.tv_nsec % 1000000000;
+
+      struct itimerspec new_value;
+      new_value.it_interval.tv_sec = 0;
+      new_value.it_interval.tv_nsec = 0;
+      new_value.it_value.tv_sec = now.tv_sec;
+      new_value.it_value.tv_nsec = now.tv_nsec;
+
+      if (timerfd_settime(timerfd, TFD_TIMER_ABSTIME, &new_value, nullptr) == -1) {
+        my_plugin_log_message(&thread_pool_hybrid_plugin, MY_ERROR_LEVEL,
+          "timerfd_settimet() returned %d", errno);
+        std::raise(SIGABRT);
+      }
+      debug_out(this, "Set timer");
+    }
   }
-  debug_out(this, "Set timer");
 }
 
 bool Thread_pool::has_thread_timed_out() {
@@ -555,11 +583,11 @@ bool Thread_pool::has_thread_timed_out() {
   do {
     state_old = state = threads_state;
     return_val = false;
-    if (state.count > max_threads_per_pool &&
-        state.lock_waiting + 1 < state.count) {
+    if (state.threads > max_threads_per_pool &&
+        state.lock_waiting + 1 < state.threads) {
       // we are outside the maximum number of threads,
       // we should die.
-      state.count--;
+      state.threads--;
       state.epoll_waiting--;
       return_val = true;
       continue;
@@ -572,7 +600,7 @@ bool Thread_pool::has_thread_timed_out() {
       auto msecs = chrono::milliseconds{keep_excess_threads_alive_ms};
       if (now - since.load() > msecs) {
         // we've had threads waiting without work for n msecs. die.
-        state.count--;
+        state.threads--;
         state.epoll_waiting--;
         return_val = true;
       }
@@ -622,6 +650,34 @@ bool Thread_pool::has_thread_timed_out() {
   return return_val;
 }
 
+void Thread_pool::decr_epoll_waiting_and_maybe_spawn_thread() {
+  Threads_state state_old, state;
+  bool spawnthread;
+  do {
+    // we got a regular event. We'll be preoccupied with processing it,
+    // so see if we should spawn another thread before we do.
+    state_old = state = threads_state;
+    state.epoll_waiting--;
+    if (state.epoll_waiting < min_waiting_threads_per_pool &&
+        state.threads < max_threads_per_pool) {
+      spawnthread = true;
+      state.threads++;
+    } else {
+      spawnthread = false;
+    }
+  } while (!threads_state.compare_exchange_weak(state_old, state));
+
+  if (spawnthread) {
+    int res = spawn_thread();
+    if (res) {
+      my_plugin_log_message(&thread_pool_hybrid_plugin, MY_ERROR_LEVEL,
+        "errno %d from spawn_thread. raising SIGABRT", errno);
+      // couldn't spawn thread likely due to low resources. kill server
+      std::raise(SIGABRT);
+    }
+  }
+}
+
 int Thread_pool::spawn_thread() {
   my_thread_handle thread;
   my_thread_attr_t attr;
@@ -632,8 +688,37 @@ int Thread_pool::spawn_thread() {
   return res;
 }
 
+THD* Thread_pool::get_channel_info_and_turn_into_thd() {
+  // this means it's a new connection. Extract the Channel_info ptr
+  // and turn it into a THD ptr
+  Channel_info *ci;
+  if (read(new_ci_pipe_read, &ci, sizeof(ci)) == -1) {
+    debug_out(this, "Got empty notification from new_ci_pipe_read");
+    return nullptr;
+  }
+  
+  THD* thd = create_thd(ci);
+
+  destroy_channel_info(ci);
+  if (thd == nullptr) {
+    increment_aborted_connects();
+    dec_connection_count();
+    Threads_state state_old, state;
+    do {
+      state_old = state = threads_state;
+      state.connections--;
+    } while (!threads_state.compare_exchange_weak(state_old, state));
+    return nullptr;
+  }
+  thd_set_scheduler_data(thd, this);
+
+  return thd;
+}
+
 void* Thread_pool::thread_start(void *p) {
   Thread_pool *tp = (Thread_pool *)p;
+  
+  debug_out(tp, "thread spawned");
 
   if (my_thread_init()) {
     my_plugin_log_message(&thread_pool_hybrid_plugin, MY_ERROR_LEVEL,
@@ -641,7 +726,6 @@ void* Thread_pool::thread_start(void *p) {
     std::raise(SIGABRT);
   }
 
-  debug_out(tp, "thread birthed");
   my_thread_self_setname("tp_hybrid");
 
   tp->thread_loop();
@@ -649,34 +733,15 @@ void* Thread_pool::thread_start(void *p) {
   my_thread_end();
 
   debug_out(tp, "thread died");
+
   return nullptr;
 }
 
 void Thread_pool::thread_loop() {
   while (true) {
+    incr_epoll_waiting_and_record_wait_start_and_maybe_set_timer();
+
     epoll_event evt;
-    Threads_state state_old, state;
-    // add us too state.epoll_waiting
-    do {
-      state_old = state = threads_state;
-      state.epoll_waiting++;
-    } while (!threads_state.compare_exchange_weak(state_old, state));
-
-    if (state.epoll_waiting <= max_threads_per_pool &&
-        state.epoll_waiting > min_waiting_threads_per_pool) {
-      // mark our slot current time
-      size_t n = state.epoll_waiting - min_waiting_threads_per_pool - 1;
-      n = (n + start_of_threads_waiting_since) %
-            (max_threads_per_pool - min_waiting_threads_per_pool);
-
-      threads_waiting_since[n].store(clock::now());
-      
-      if (state.epoll_waiting - min_waiting_threads_per_pool == 1) {
-        // we are the first excess thread now waiting, starting the
-        // timer so a thread if unecessary.
-        set_time_out_timer();
-      }
-    }
 wait_again:
     debug_out(this, "Waiting in epoll");
     int cnt = epoll_wait(epfd, &evt, 1, -1);
@@ -692,7 +757,7 @@ wait_again:
       }
     }
     
-    if (evt.data.u64 == 2) {
+    if (evt.data.u64 == EVENT_TIMER) {
       if (has_thread_timed_out()) {
         return;
       } else {
@@ -700,69 +765,29 @@ wait_again:
       }
     }
   
-    if (evt.data.u64 == 0) {
+    if (evt.data.u64 == EVENT_SHUTDOWN) {
       // this means we should die as it's the shutdown or unload event.
       // Don't clear the event, other threads will want this event too.
+      Threads_state state_old, state;
       do {
         state_old = state = threads_state;
-        state.count--;
+        state.threads--;
         state.epoll_waiting--;
       } while (!threads_state.compare_exchange_weak(state_old, state));
       return;
     }
-    
-    bool spawnthread;
-    do {
-      // we got a regular event. We'll be preoccupied with processing it,
-      // so see if we should spawn another thread before we do.
-      state_old = state = threads_state;
-      state.epoll_waiting--;
-      if (state.epoll_waiting < min_waiting_threads_per_pool &&
-          state.count < max_threads_per_pool) {
-        spawnthread = true;
-        state.count++;
-      } else {
-        spawnthread = false;
-      }
-    } while (!threads_state.compare_exchange_weak(state_old, state));
-  
-    if (spawnthread) {
-      int res = spawn_thread();
-      if (res) {
-        my_plugin_log_message(&thread_pool_hybrid_plugin, MY_ERROR_LEVEL,
-          "errno %d from spawn_thread. raising SIGABRT", errno);
-        // couldn't spawn thread likely due to low resources. kill server
-        std::raise(SIGABRT);
-      }
-    }
+
+    decr_epoll_waiting_and_maybe_spawn_thread();
 
     THD *thd;
     bool is_new_thd;
-    if (evt.data.u64 == 1) {
-      // this means it's a new connection. Extract the Channel_info ptr
-      // and turn it into a THD ptr
-      Channel_info *ci;
-      if (read(new_ci_pipe_read, &ci, sizeof(ci)) == -1) {
-        debug_out(this, "Got empty notification from new_ci_pipe_read");
+    if (evt.data.u64 == EVENT_CHANNEL_INFO) {
+      if ((thd = get_channel_info_and_turn_into_thd()) == nullptr)
         continue;
-      }
       is_new_thd = true;
-      thd = create_thd(ci);
-
-      destroy_channel_info(ci);
-      if (thd == nullptr) {
-        increment_aborted_connects();
-        dec_connection_count();
-        do {
-          state_old = state = threads_state;
-          state.connection_count--;
-        } while (!threads_state.compare_exchange_weak(state_old, state));
-        continue;
-      }
-      thd_set_scheduler_data(thd, this);
-    } else {
-      is_new_thd = false;
+    } else { // EVENT_THD It's a THD woken by a client sending data
       thd = (THD *)evt.data.ptr;
+      is_new_thd = false;
     }
 
     Client_event(this, thd).process(is_new_thd, evt.events);
@@ -787,11 +812,11 @@ static bool add_connection(Channel_info *ci) {
   Thread_pool::Threads_state state_old, state;
   do {
     state_old = state = tp->threads_state;
-    state.connection_count++; // decremented in Client_event::clean_up_thd()
+    state.connections++; // decremented in Client_event::clean_up_thd()
   } while (!tp->threads_state.compare_exchange_weak(state_old, state));
   
   if (enable_connection_per_thread_mode &&
-      state.connection_count == max_threads_per_pool + 1) {
+      state.connections == max_threads_per_pool + 1) {
     // signal 'switch to epoll' to any threads waiting in poll
     uint64_t val = max_threads_per_pool;
     if (write(tp->evfd_poll, &val, sizeof(val))) {
@@ -885,8 +910,8 @@ static void Thd_wait_begin(THD *thd, int wait_type) {
         do {
           state_old = state = tp->threads_state;
           state.lock_waiting++;
-          if (state.count == state.lock_waiting) {
-            state.count++;
+          if (state.threads == state.lock_waiting) {
+            state.threads++;
             spawnthread = true;
           } else {
             spawnthread = false;
@@ -1008,7 +1033,6 @@ static int plugin_deinit(MYSQL_PLUGIN plugin_ref [[maybe_unused]]) {
   (void)my_connection_handler_reset();
   return 0;
 }
-
 
 struct st_mysql_daemon plugin_daemom = {MYSQL_DAEMON_INTERFACE_VERSION};
 
