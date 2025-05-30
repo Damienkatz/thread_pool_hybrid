@@ -140,6 +140,7 @@ The debug messages look like this:
 
 302385=*sequence number* 256980=*thread_id* [29=*epollfd*,3=*threads*,3=*epoll_waiting*,0=*lock_waiting*,0=*connections*] Waiting in epoll=*message*
 
+|---|---|
 |**sequence number**| A monotonically increasing number. |
 |**threadid** | The Linux thread id for the thread the message is about. |
 |**epollfd** | The epoll fd for the thread pool the thread is in. |
@@ -174,4 +175,3 @@ To display all the information about the first thread pool at once, use this lin
     +---------+---------------+--------------+-------------+
     |       5 |             4 |            0 |           1 |
     +---------+---------------+--------------+-------------+
-    
