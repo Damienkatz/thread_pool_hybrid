@@ -49,6 +49,8 @@ If your Linux server is dedicated to just running MySQL, you should probably not
 
 * thread_pool_hybrid_total_thread_pools
 
+| Description | Value |
+| --- | --- |
 | **Command-Line Format** | --thread_pool_hybrid_total_thread_pools=#|
 | **System Variable** | thread_pool_hybrid_total_thread_pools |
 | **Dynamic** | No |
@@ -61,6 +63,8 @@ Total thread pools. Setting to 0 defaults to number cores available.
 
 * thread_pool_hybrid_max_threads_per_pool
 
+| Description | Value |
+| --- | --- |
 | **Command-Line Format** | --thread_pool_hybrid_max_threads_per_pool=#|
 | **System Variable** | thread_pool_hybrid_max_threads_per_pool=# |
 | **Dynamic** | No |
@@ -73,6 +77,8 @@ Maximum number of the threads per pool. Though the total count can grow larger t
 
 * thread_pool_hybrid_min_waiting_threads_per_pool
 
+| Description | Value |
+| --- | --- |
 | **Command-Line Format** | --thread_pool_hybrid_min_waiting_threads_per_pool=#|
 | **System Variable** | thread_pool_hybrid_min_waiting_threads_per_pool=# |
 | **Dynamic** | No |
@@ -85,6 +91,8 @@ Until the thread counts reaches maximum, the minimum threads waiting in epoll_wa
 
 * thread_pool_hybrid_min_waiting_threads_per_pool
 
+| Description | Value |
+| --- | --- |
 | **Command-Line Format** | --thread_pool_hybrid_keep_excess_threads_alive_ms=milliseconds |
 | **System Variable** | thread_pool_hybrid_keep_excess_threads_alive_ms=milliseconds |
 | **Dynamic** | Yes |
@@ -97,6 +105,8 @@ How long extra threads -- above thread_pool_hybrid_min_waiting_threads_per_pool 
 
 * thread_pool_hybrid_enable_connection_per_thread_mode
 
+| Description | Value |
+| --- | --- |
 | **Command-Line Format** | --thread_pool_hybrid_enable_connection_per_thread_mode=ON/OFF |
 | **System Variable** | thread_pool_hybrid_keep_excess_threads_alive_ms==ON/OFF |
 | **Dynamic** | Yes |
@@ -107,6 +117,8 @@ Enables or disables connection-per-thread mode until the connection count is gre
 
 * thread_pool_hybrid_debug_out_file
 
+| Description | Value |
+| --- | --- |
 | **Command-Line Format** | --thread_pool_hybrid_debug_out_file=/path/to/thread/pool/debug/out/file|
 | **System Variable** | thread_pool_hybrid_debug_out_file=/path/to/thread/pool/debug/out/file |
 | **Dynamic** | Yes |
@@ -140,7 +152,7 @@ The debug messages look like this:
 
 302385=*sequence number* 256980=*thread_id* [29=*epollfd*,3=*threads*,3=*epoll_waiting*,0=*lock_waiting*,0=*connections*] Waiting in epoll=*message*
 
-| Field | description |
+| Field | Description |
 | --- | --- |
 | **sequence number**| A monotonically increasing number. |
 |**threadid** | The Linux thread id for the thread the message is about. |
@@ -158,6 +170,9 @@ This function gives information about the Nth (starting from zero) thread pool.
 Valid range for thread_pool is 0 to thread_pool_hybrid_total_thread_pools - 1.
 
 Valid numbers for info are:
+
+| Value | Field | Description |
+| --- | --- | --- |
 
 | 0 | threads | The number of the threads in the thread pool. |
 | 1 | epoll_waiting | The number of threads waiting in the thread pool in epoll_wait. |
