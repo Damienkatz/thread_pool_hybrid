@@ -975,6 +975,73 @@ THD_event_functions thd_event = {
   Post_kill_notification
 };
 
+
+/******************************************************************************
+ * User Defined Function: tph(pool INT, info INT) returns INT
+ * 
+ * To use, on mysql client, do:
+ *  CREATE FUNCTION tph RETURNS INT SONAME "thread_pool_hybrid.so";
+ * 
+ * Pool is the pool # starting from zero.
+ * 
+ * Info is 0-3 where
+ *  0 == threads
+ *  1 == epoll_wating
+ *  2 == lock_wating
+ *  3 == connections
+ ******************************************************************************/
+
+extern "C"
+bool tph_init(UDF_INIT *initid, UDF_ARGS *args, char *message) {
+  if (args->arg_count != 2 ||
+      args->arg_type[0] != INT_RESULT || 
+      args->arg_type[0] != INT_RESULT) {
+    strcpy(message, "tph() takes 2 integer arguments");
+    return true;
+  }
+  
+  initid->max_length = 9;
+  initid->const_item = false;
+  initid->maybe_null = true;
+  return false;
+}
+
+extern "C"
+void tph_deinit(UDF_INIT *) {
+}
+
+extern "C"
+long long tph(UDF_INIT *, UDF_ARGS *args, char *,
+                        unsigned char *null_value,
+                        unsigned char *) {
+  if (!args->args[0]) {
+    *null_value = 1;
+    return 0;
+  }
+  int pool_n = (int)*((long long *)args->args[0]);
+
+  if (pool_n < 0 || pool_n >= (int)total_thread_pools) {
+    *null_value = 1;
+    return 0;
+  }
+
+  Thread_pool::Threads_state s = Thread_pool::thread_pools[pool_n].threads_state;
+  switch (*((long long *)args->args[1])) {
+    case 0:
+      return (long long)s.threads;
+    case 1:
+      return (long long)s.epoll_waiting;
+    case 2:
+      return (long long)s.lock_waiting;
+    case 3:
+      return (long long) s.connections;
+    default:
+      *null_value = 1;
+      return 0;
+  }
+}
+
+
 /******************************************************************************
  * Connection handler module initializer/denitializer
  ******************************************************************************/
