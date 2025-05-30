@@ -51,7 +51,7 @@ static unsigned int total_thread_pools = 0;
 static MYSQL_SYSVAR_UINT(
   total_thread_pools, total_thread_pools,
   PLUGIN_VAR_READONLY | PLUGIN_VAR_OPCMDARG,
-  "Total thread pools. Settring to 0 defaults to number cores available.",
+  "Total thread pools. Setting to 0 defaults to number cores available.",
   NULL, NULL, 0, 0, 0xFFFF, 0);
 
 static unsigned int max_threads_per_pool = 1;
@@ -76,8 +76,8 @@ static uint64_t keep_excess_threads_alive_ms = 0;
 
 static MYSQL_SYSVAR_ULONG(
   keep_excess_threads_alive_ms, keep_excess_threads_alive_ms,
-  PLUGIN_VAR_READONLY | PLUGIN_VAR_OPCMDARG,
-  "How long, in ms, should an extra thread wait idle before dieing. 0 to"
+  PLUGIN_VAR_OPCMDARG,
+  "How long, in ms, should an extra thread wait idle before dying. 0 to"
   " instantly die.",
   NULL, NULL, 50, 0, ~0ULL, 0);
 
