@@ -173,7 +173,6 @@ Valid numbers for info are:
 
 | Value | Field | Description |
 | --- | --- | --- |
-
 | 0 | threads | The number of the threads in the thread pool. |
 | 1 | epoll_waiting | The number of threads waiting in the thread pool in epoll_wait. |
 | 2 | lock_waiting | The number of the threads waiting in the thread pool on a lock. |
