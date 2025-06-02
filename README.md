@@ -28,7 +28,7 @@ You uninstall like this:
 
     mysql> UNINSTALL PLUGIN THREAD_POOL_HYBRID;
 
-However it will uninstall the library and then ***crash the server!*** This is because uninstalling this way removes the thread_pool_hybrid code from the running server, but that same code is currently serving the client request. So it crashes, haviong the code it is in the middle of running, go away.
+However it will uninstall the library and then ***crash the server!*** This is because uninstalling this way removes the thread_pool_hybrid code from the running server, but that same code is currently serving the client request. So it crashes, having the code it is in the middle of running, *disappear*.
 
 Or you can install by adding this to a config file (often in `/etc/my.cnf`):
 
@@ -61,7 +61,7 @@ If your Linux server is dedicated to just running MySQL, you should probably not
 
 Total thread pools. Setting to 0 defaults to number cores available.
 
-* thread_pool_hybrid_max_threads_per_pool
+### thread_pool_hybrid_max_threads_per_pool
 
 | Description | Value |
 | --- | --- |
@@ -75,7 +75,7 @@ Total thread pools. Setting to 0 defaults to number cores available.
 
 Maximum number of the threads per pool. Though the total count can grow larger than this if all the threads are waiting on lock(s), as the connection holding the lock(s) might not have a thread and the server would hang due to resource deadlock. So it will add a thread and serve another connection until all the coonections either have a thread or the lock(s) are released.
 
-* thread_pool_hybrid_min_waiting_threads_per_pool
+### thread_pool_hybrid_min_waiting_threads_per_pool
 
 | Description | Value |
 | --- | --- |
@@ -89,7 +89,7 @@ Maximum number of the threads per pool. Though the total count can grow larger t
 
 Until the thread counts reaches maximum, the minimum threads waiting in epoll_wait. This is so if there is a sudden surge in connections the server can keep up by using threads in reserve.
 
-* thread_pool_hybrid_min_waiting_threads_per_pool
+### thread_pool_hybrid_min_waiting_threads_per_pool
 
 | Description | Value |
 | --- | --- |
@@ -103,7 +103,7 @@ Until the thread counts reaches maximum, the minimum threads waiting in epoll_wa
 
 How long extra threads -- above thread_pool_hybrid_min_waiting_threads_per_pool -- should wait in milliseconds inside epoll_waiting before dyings. 0 to instantly die.
 
-* thread_pool_hybrid_enable_connection_per_thread_mode
+### thread_pool_hybrid_enable_connection_per_thread_mode
 
 | Description | Value |
 | --- | --- |
@@ -115,7 +115,7 @@ How long extra threads -- above thread_pool_hybrid_min_waiting_threads_per_pool 
 
 Enables or disables connection-per-thread mode until the connection count is greater than thread_pool_hybrid_max_threads_per_pool. Why switch it off? I dunno, to test how slow epoll is with a lower connection count?
 
-* thread_pool_hybrid_debug_out_file
+### thread_pool_hybrid_debug_out_file
 
 | Description | Value |
 | --- | --- |
@@ -149,6 +149,7 @@ The debug messages look like this:
     302385 256980 [29,3,3,0,0] Waiting in epoll
     302386 256980 [29,3,3,0,0] Checking has_thread_timed_out()
 
+An explanation of the values:
 
 302385=*sequence number* 256980=*thread_id* [29=*epollfd*,3=*threads*,3=*epoll_waiting*,0=*lock_waiting*,0=*connections*] Waiting in epoll=*message*
 
@@ -163,7 +164,7 @@ The debug messages look like this:
 |**connection** | The total number of connections assigned the the thread pool. |
 |**message** | A message describing what the thread is doing. |
 
-## User defined function: tph(thread_pool INT, info INT) returns INT
+## User defined function: TPH(thread_pool INT, info INT) returns INT
 
 This function gives information about the Nth (starting from zero) thread pool.
 

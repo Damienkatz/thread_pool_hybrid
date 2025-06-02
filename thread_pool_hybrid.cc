@@ -918,7 +918,7 @@ static void Thd_wait_begin(THD *thd, int wait_type) {
           }
         } while (!tp->threads_state.compare_exchange_weak(state_old, state));
         
-        // encode our that this thd is waiting on locks in the unused bits in the
+        // encode pointer that this thd is waiting on locks in the unused bits in the
         // pointer to the thd's scheduler_data. Least Significant Bit is fine, as
         // the tp will be 64bit aligned and never odd.
         thd_set_scheduler_data(thd, (void *)((uintptr_t)tp | (uintptr_t)1));
@@ -996,7 +996,7 @@ bool tph_init(UDF_INIT *initid, UDF_ARGS *args, char *message) {
   if (args->arg_count != 2 ||
       args->arg_type[0] != INT_RESULT || 
       args->arg_type[0] != INT_RESULT) {
-    strcpy(message, "tph() takes 2 integer arguments");
+    strcpy(message, "TPH() takes 2 integer arguments");
     return true;
   }
   
@@ -1011,7 +1011,7 @@ void tph_deinit(UDF_INIT *) {
 }
 
 extern "C"
-long long tph(UDF_INIT *, UDF_ARGS *args, char *,
+long long TPH(UDF_INIT *, UDF_ARGS *args, char *,
                         unsigned char *null_value,
                         unsigned char *) {
   if (!args->args[0]) {
@@ -1034,7 +1034,7 @@ long long tph(UDF_INIT *, UDF_ARGS *args, char *,
     case 2:
       return (long long)s.lock_waiting;
     case 3:
-      return (long long) s.connections;
+      return (long long)s.connections;
     default:
       *null_value = 1;
       return 0;
