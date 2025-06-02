@@ -47,7 +47,7 @@ And uninstall by removing these settings.
 
 If your Linux server is dedicated to just running MySQL, you should probably not worry about changing the defaults, you won't see much, if any, performance gain by changing things. But if the server is shared with a application server and or you just want to play around, here are all the configurable parameters you can add the configuration file or command line parameters.
 
-* thread_pool_hybrid_total_thread_pools
+### thread_pool_hybrid_total_thread_pools
 
 | Description | Value |
 | --- | --- |
