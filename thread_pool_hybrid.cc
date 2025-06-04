@@ -177,10 +177,10 @@ struct Thread_pool {
   int evfd_epoll = -1;             /* eventfd to shutdown the threads in epoll */
 
   struct Threads_state {
-    uint32_t threads = 0;         /* total threads in Thread_pool */
-    uint32_t epoll_waiting = 0;   /* total threads waiting on epoll in Thread_pool */
-    uint32_t lock_waiting = 0;    /* total threads waiting on a lock in Thread_pool */
-    uint32_t connections = 0;     /* total clients connected to the Thread_pool */
+    uint16_t threads = 0;         /* total threads in Thread_pool */
+    uint16_t epoll_waiting = 0;   /* total threads waiting on epoll in Thread_pool */
+    uint16_t lock_waiting = 0;    /* total threads waiting on a lock in Thread_pool */
+    uint16_t connections = 0;     /* total clients connected to the Thread_pool */
   };
 
   atomic<Threads_state> threads_state;
@@ -204,7 +204,7 @@ struct Thread_pool {
 
   static atomic<bool> shutdown;
   static Thread_pool* thread_pools;
-  static atomic<size_t> next_thread_pool;
+  static size_t next_thread_pool;
 
   Thread_pool();
   ~Thread_pool();
@@ -225,7 +225,7 @@ struct Thread_pool {
 
 atomic<bool> Thread_pool::shutdown = false;
 Thread_pool* Thread_pool::thread_pools = nullptr;
-atomic<size_t> Thread_pool::next_thread_pool = 0;
+size_t Thread_pool::next_thread_pool = 0;
 
 /******************************************************************************
  * Client_event class + definitions
@@ -799,19 +799,22 @@ wait_again:
  ******************************************************************************/
 
 static bool add_connection(Channel_info *ci) {
+try_next_pool:
   // first assign this connection to a thread_pool
-  size_t next;
-  size_t nextnext;
-  do {
-     next = Thread_pool::next_thread_pool;
-     nextnext = next + 1;
-     if (nextnext == total_thread_pools) nextnext = 0;
-  } while (!Thread_pool::next_thread_pool.compare_exchange_weak(next, nextnext));
+  size_t next = Thread_pool::next_thread_pool++;
+  if (Thread_pool::next_thread_pool == total_thread_pools)
+    Thread_pool::next_thread_pool = 0;
 
   Thread_pool *tp = &Thread_pool::thread_pools[next];
   Thread_pool::Threads_state state_old, state;
   do {
     state_old = state = tp->threads_state;
+    if (state.connections == 0xFFFF) {
+      //Thread_pool cannot take any more connectons. try next pool.
+      // We will loop around until we find thread a pool that can take the connection.
+      // it's possible we never find a pool and loop indefintely until a connection drops.
+      goto try_next_pool;
+    }
     state.connections++; // decremented in Client_event::clean_up_thd()
   } while (!tp->threads_state.compare_exchange_weak(state_old, state));
   
@@ -832,7 +835,9 @@ static bool add_connection(Channel_info *ci) {
   return false;
 }
 
+//FWD DECL
 static void Post_kill_notification(THD *thd);
+
 static void end() {
   //kill all our connections except the one on the stack
   do_for_all_thd(
@@ -910,7 +915,7 @@ static void Thd_wait_begin(THD *thd, int wait_type) {
         do {
           state_old = state = tp->threads_state;
           state.lock_waiting++;
-          if (state.threads == state.lock_waiting) {
+          if (state.threads == state.lock_waiting && state.threads != 0xFFFF) {
             state.threads++;
             spawnthread = true;
           } else {
