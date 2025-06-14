@@ -77,8 +77,8 @@ static uint64_t keep_excess_threads_alive_ms = 0;
 static MYSQL_SYSVAR_ULONG(
   keep_excess_threads_alive_ms, keep_excess_threads_alive_ms,
   PLUGIN_VAR_OPCMDARG,
-  "How long, in ms, should an extra thread wait idle before dying. 0 to"
-  " instantly die.",
+  "How long, in milliseconds, should an extra thread wait idle before dying. "
+  "0 to instantly die.",
   NULL, NULL, 50, 0, ~0ULL, 0);
 
 static bool enable_connection_per_thread_mode;
@@ -95,8 +95,10 @@ static MYSQL_SYSVAR_BOOL(
 static char *debug_out_file = nullptr;
 static FILE *debug_file = nullptr;
 
-static int check_debug_out_file(MYSQL_THD thd[[maybe_unused]], SYS_VAR *self[[maybe_unused]],
-                                  void *save, struct st_mysql_value *value) {
+static int check_debug_out_file(MYSQL_THD thd[[maybe_unused]],
+                                SYS_VAR *self[[maybe_unused]],
+                                void *save,
+                                struct st_mysql_value *value) {
   int value_len = 0;
   if (value == nullptr) return true;
 
@@ -168,20 +170,27 @@ if (debug_file) { \
  ******************************************************************************/
 
 struct Thread_pool {
-  int epfd = -1;                  /* epoll fd used by pool */
-  int new_ci_pipe_read = -1;      /* Used by new_connection() and epoll_wait()... */
-  int new_ci_pipe_write = -1;     /*... to communicate a new connection  */
-  int timerfd = -1;               /* Used to kill off excess threads at interval */
-  int evfd_poll = -1;             /* eventfd to shutdown the threads in poll 
-                                     or convert them to epoll */
-  int evfd_epoll = -1;             /* eventfd to shutdown the threads in epoll */
+  int epfd = -1;                  // epoll fd used by pool
+
+  int new_ci_pipe_read = -1;      // Used by new_connection(...) and
+  int new_ci_pipe_write = -1;     // epoll_wait(...) to communicate a new
+                                  // connection to the thread pool
+
+  int timerfd = -1;               // Used to kill off excess threads at interval
+
+  int evfd_poll = -1;             // eventfd to shutdown the threads in poll 
+                                  //  or convert them to epoll
+
+  int evfd_epoll = -1;            // eventfd to shutdown the threads in epoll
 
   struct Threads_state {
-    uint16_t threads = 0;         /* total threads in Thread_pool */
-    uint16_t epoll_waiting = 0;   /* total threads waiting on epoll in Thread_pool */
-    uint16_t lock_waiting = 0;    /* total threads waiting on a lock in Thread_pool */
-    uint16_t connections = 0;     /* total clients connected to the Thread_pool */
+    // atmoic var Represents the state of the threads & connections
+    uint16_t threads = 0;         // threads in Thread_pool
+    uint16_t epoll_waiting = 0;   // threads waiting on epoll in Thread_pool
+    uint16_t lock_waiting = 0;    // threads waiting on a lock in Thread_pool
+    uint16_t connections = 0;     // clients connected to the Thread_pool
   };
+  static_assert(sizeof(Threads_state) == sizeof(uint64_t)); // make sure no padding
 
   atomic<Threads_state> threads_state;
 
@@ -189,12 +198,12 @@ struct Thread_pool {
   typedef chrono::time_point<chrono::steady_clock> time_point;
   typedef chrono::duration<chrono::steady_clock> duration;
   
-  atomic<time_point> *threads_waiting_since;
+  atomic<time_point> *threads_waiting_since;  /* an array of times when more threads */
   atomic<size_t> start_of_threads_waiting_since;
   atomic<bool> timer_set = false;
 
+  /** These are the values returned in epoll_event.data.u64 by epoll_wait. */
   enum {
-    // These are the values returned in epoll_event.data.u64 by epoll_wait.
     EVENT_SHUTDOWN = 0,
     EVENT_TIMER = 1,
     EVENT_CHANNEL_INFO = 2
@@ -276,6 +285,7 @@ int Thread_pool::initialize() {
   if ((epfd = epoll_create1(EPOLL_CLOEXEC)) == -1)
     return errno;
 
+  /* pipes are created blocking */
   int pipes[2] = {-1, -1};
   if (pipe2(pipes, O_CLOEXEC | O_DIRECT) == -1)
     return errno;
@@ -283,7 +293,8 @@ int Thread_pool::initialize() {
   new_ci_pipe_read = pipes[0];
   new_ci_pipe_write = pipes[1];
   
-  int flags = fcntl(new_ci_pipe_write, F_GETFL, 0);
+  /* Now set new_ci_pipe_read to non-blocking. Write pipe stays blocking */
+  int flags = fcntl(new_ci_pipe_read, F_GETFL, 0);
   if (fcntl(new_ci_pipe_read, F_SETFL, flags | O_NONBLOCK) == -1)
     return errno;
   
@@ -338,7 +349,6 @@ void Thread_pool::shutdown_pool() {
   if (write(evfd_poll, &val, sizeof(val))) {
     // placate compiler -Wunused-result
   }
-
   // clear out any unprocessed Channel_infos
   Channel_info *ci;
   while (read(new_ci_pipe_read, &ci, sizeof(ci)) == sizeof(ci)) {
@@ -379,7 +389,6 @@ void Thread_pool::shutdown_pool() {
 
 void Thread_pool::incr_epoll_waiting_and_record_wait_start_and_maybe_set_timer() {
   Threads_state state_old, state;
-
   // add us to state.epoll_waiting
   do {
     state_old = state = threads_state;
@@ -446,6 +455,9 @@ bool Thread_pool::has_thread_timed_out() {
       state.threads--;
       state.epoll_waiting--;
       return_val = true;
+
+      debug_out(this, "thread has decided to die because above"
+                      " max_threads_per_pool");
       continue;
     }
 
@@ -459,12 +471,15 @@ bool Thread_pool::has_thread_timed_out() {
         state.threads--;
         state.epoll_waiting--;
         return_val = true;
+
+        debug_out(this, "thread has decided to die because without work for"
+                        " keep_excess_threads_alive_ms");
       }
     }
   } while (!threads_state.compare_exchange_weak(state_old, state));
 
   if (return_val)
-    debug_out(this, "thread has decided to die");
+    debug_out(this, "thread has confirmed going to die");
 
   size_t start_old, start = start_of_threads_waiting_since;
   if (return_val) {
@@ -500,7 +515,7 @@ bool Thread_pool::has_thread_timed_out() {
   } else {
     // no other thread waiting, set timer off
     // While it's possible other threads are waiting because we are racing them, the next
-    // thread to wait set timerfd_settime and turns the timer_set to true.
+    // thread to wait sets timerfd_settime and turns the timer_set to true.
     timer_set.store(false);
   }
   return return_val;
@@ -622,7 +637,6 @@ wait_again:
     }
   
     if (evt.data.u64 == EVENT_SHUTDOWN) {
-      // this means we should die as it's the shutdown or unload event.
       // Don't clear the event, other threads will want this event too.
       Threads_state state_old, state;
       do {
@@ -639,9 +653,10 @@ wait_again:
     bool is_new_thd;
     if (evt.data.u64 == EVENT_CHANNEL_INFO) {
       if ((thd = get_channel_info_and_turn_into_thd()) == nullptr)
-        continue;
+        continue; // another thread processed this event
       is_new_thd = true;
-    } else { // EVENT_THD It's a THD woken by a client sending data
+    } else {
+      // EVENT_THD It's a THD woken by a client sending data
       thd = (THD *)evt.data.ptr;
       is_new_thd = false;
     }
@@ -654,9 +669,9 @@ wait_again:
  *******************************************************************************/
 
 bool Thread_pool::use_connection_per_thread() {
-  return !shutdown.load() &&
-          enable_connection_per_thread_mode &&
-          threads_state.load().connections <= max_threads_per_pool;
+  return threads_state.load().connections <= max_threads_per_pool &&
+         !shutdown.load() &&
+         enable_connection_per_thread_mode;
 }
 
 void Thread_pool::clean_up_thd(THD *thd) {
@@ -693,18 +708,16 @@ void Thread_pool::process(THD *thd, bool is_new_thd, int epoll_events) {
     if (!thd_prepare_connection(thd)) {
       if (use_connection_per_thread()) {
         // Successful handshake, we have enough threads available to
-        // go the use_connection_per_thread path. If we should be in epoll
-        // we'll get an event through evfd_poll and kick us out into epoll.
+        // go the use_connection_per_thread path. If we should be in poll
+        // and use_connection_per_thread() would return false we'll get
+        // an event through evfd_poll and kick us out into epoll.
         // So it's ok that the call to use_connection_per_thread()
         // can switch to false before we call poll.
         goto use_connection_per_thread;
       } else {
-        // Successful handshake. more connections than threads. use epoll.
+        // Successful handshake, more connections than threads. use epoll.
         // it's ok to be in epoll when we should be in poll, because any
         // client event in epoll will kick us back to the poll path.
-        // But it's not ok to be in poll when we should be epoll, because
-        // only the client event for the specifc connection can fire and
-        // wake us up.
         add_to_epoll(thd, is_new_thd);
         return;
       }
@@ -777,19 +790,17 @@ do_command:
     if (!do_command(thd)) {
       // successfully processed. 
       if (use_connection_per_thread()) {
-        // We have enough threads available to go the
-        // use_connection_per_thread path. If we should be in epoll
-        // we'll get an event through evfd_poll and kick us out into epoll.
+        // Successful processing, we have enough threads available to
+        // go the use_connection_per_thread path. If we should be in poll
+        // and use_connection_per_thread() would return false we'll get
+        // an event through evfd_poll and kick us out into epoll.
         // So it's ok that the call to use_connection_per_thread()
         // can switch to false before we call poll.
         goto use_connection_per_thread;
       } else {
-        // More connections than threads. use epoll.
+        // Successful processing, more connections than threads. use epoll.
         // it's ok to be in epoll when we should be in poll, because any
         // client event in epoll will kick us back to the poll path.
-        // But it's not ok to be in poll when we should be epoll, because
-        // only the client event for the specifc connection can fire and
-        // wake us up.
         add_to_epoll(thd, is_new_thd);
         return;
       }
@@ -839,7 +850,7 @@ try_next_pool:
   }
   
   if (write(tp->new_ci_pipe_write, &ci, sizeof(ci)) != sizeof(ci)) {
-    // this should not happen
+    // this is a blocking pipe and should not happen
     std::raise(SIGABRT);
   }
 
@@ -852,7 +863,7 @@ void Thread_pool::end() {
   for (size_t i = 0; i < total_thread_pools; i++)
     thread_pools[i].shutdown_pool();
   
-    // free the mem
+  // free the mem
   delete[] thread_pools;
   
   // null out
@@ -876,8 +887,7 @@ Connection_handler_functions conn_handler = {
  *****************************************************************************/
 
 void Thread_pool::Thd_wait_begin(THD *thd, int wait_type) {
-  if (!thd)
-    thd = thd_get_current_thd();
+  if (!thd) thd = thd_get_current_thd();
   if (!thd) return;
 
   switch (wait_type) {
@@ -956,7 +966,9 @@ void Thread_pool::Thd_wait_end(THD *thd) {
 }
 
 void Thread_pool::Post_kill_notification(THD *thd) {
+  // if it has scheduler_data, it's ours
   if (thd_get_scheduler_data(thd)) {
+    // this will alert both epoll and poll
     ::shutdown(thd_get_fd(thd), SHUT_RD);
   }
 }
