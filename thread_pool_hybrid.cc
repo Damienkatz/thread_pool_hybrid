@@ -215,6 +215,38 @@ struct Thread_pool {
   static Thread_pool* thread_pools;
   static size_t next_thread_pool;
 
+  /**
+   * Represents the scheduler_data stored in a thd, which is stored as a
+   * void pointer. This allows us to attach state to thd without allocation.
+   */
+  struct thd_scheduler_data {
+    uint16_t offset = 0; // offset into thread_pools that contains thd
+    uint16_t flags = 1;  // flags about the connection. 1 always set so it's
+                         // distiguishable from a null ptr when offset is 0
+                         // and no flags
+    enum {
+      FLAG_LOCKED = 2
+    };
+#if UINTPTR_MAX == 0xFFFFFFFFFFFFFFFFu
+    uint32_t padding = 0;
+#endif
+    thd_scheduler_data(uint16_t offset_in) : offset(offset_in) {}
+
+    thd_scheduler_data(void *ptr) {
+      if (ptr == nullptr) std::raise(SIGABRT);
+      memcpy(this, &ptr, sizeof(ptr));
+    }
+    Thread_pool *tp() {
+      return &thread_pools[offset];
+    }
+    void *to_ptr() {
+      void *v;
+      memcpy(&v, this, sizeof(thd_scheduler_data));
+      return v;
+    }
+  };
+  static_assert(sizeof(thd_scheduler_data) == sizeof(void *));
+
   Thread_pool();
   ~Thread_pool();
 
@@ -378,10 +410,10 @@ void Thread_pool::shutdown_pool() {
       // Last thread might be this thread doing the teardown. if so skip it.
       // Thread will shutdown once this request is complete.
       THD *thd = thd_get_current_thd();
-      if (thd) {
-        if (this == (Thread_pool *)(~(uintptr_t)1 & (uintptr_t)thd_get_scheduler_data(thd)))
+      if (thd && thd_get_scheduler_data(thd)) {
+        if (this == thd_scheduler_data(thd_get_scheduler_data(thd)).tp())
           // its our thread still alive. return
-          break;
+          return;
       }
     }
   }
@@ -581,7 +613,8 @@ THD* Thread_pool::get_channel_info_and_turn_into_thd() {
     } while (!threads_state.compare_exchange_weak(state_old, state));
     return nullptr;
   }
-  thd_set_scheduler_data(thd, this);
+  
+  thd_set_scheduler_data(thd, thd_scheduler_data(this - thread_pools).to_ptr());
 
   return thd;
 }
@@ -905,8 +938,10 @@ void Thread_pool::Thd_wait_begin(THD *thd, int wait_type) {
       threads count, create another thread so the holder(s) of the lock(s) has a
       chance to continue its transaction and unstick the server.
       */
-      Thread_pool *tp = (Thread_pool *)thd_get_scheduler_data(thd);
-      if (tp) {
+      void *vdata = thd_get_scheduler_data(thd);
+      if (vdata) {
+        thd_scheduler_data data(vdata);
+        Thread_pool *tp = data.tp();
         Threads_state state_old, state;
         bool spawnthread;
         do {
@@ -919,11 +954,9 @@ void Thread_pool::Thd_wait_begin(THD *thd, int wait_type) {
             spawnthread = false;
           }
         } while (!tp->threads_state.compare_exchange_weak(state_old, state));
-        
-        // encode pointer that this thd is waiting on locks in the unused bits in the
-        // pointer to the thd's scheduler_data. Least Significant Bit is fine, as
-        // the tp will be 64bit aligned and never odd.
-        thd_set_scheduler_data(thd, (void *)((uintptr_t)tp | (uintptr_t)1));
+
+        data.flags |= thd_scheduler_data::FLAG_LOCKED;
+        thd_set_scheduler_data(thd, data.to_ptr());
 
         if (!spawnthread)
           return;
@@ -948,19 +981,19 @@ void Thread_pool::Thd_wait_end(THD *thd) {
   if (!thd) return;
   // see if we've encoded that this thread is in a lock (see Thd_wait_begin) in
   // the scheduler data 
-  uintptr_t encoded_ptr = (uintptr_t)thd_get_scheduler_data(thd);
-  bool is_in_lock = (encoded_ptr & (uintptr_t)1) != 0;
+  void *vdata = thd_get_scheduler_data(thd);
+  if (!vdata) return;
+  thd_scheduler_data data(vdata);
 
-  if (is_in_lock) {
-    // strip out the lowest
-    Thread_pool *tp = (Thread_pool*)(encoded_ptr & ~(uintptr_t)1);
-    // set the lowest bit to off
-    thd_set_scheduler_data(thd, tp);
+  if ((data.flags & thd_scheduler_data::FLAG_LOCKED)) {
+    data.flags &= ~thd_scheduler_data::FLAG_LOCKED;
+    // set the locked bit to off
+    thd_set_scheduler_data(thd, data.to_ptr());
     Threads_state state_old, state;
     do {
-      state_old = state = tp->threads_state;
+      state_old = state = data.tp()->threads_state;
       state.lock_waiting--;
-    } while (!tp->threads_state.compare_exchange_weak(state_old, state));
+    } while (!data.tp()->threads_state.compare_exchange_weak(state_old, state));
     
   }
 }
