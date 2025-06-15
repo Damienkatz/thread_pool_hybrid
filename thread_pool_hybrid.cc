@@ -183,8 +183,10 @@ struct Thread_pool {
 
   int evfd_epoll = -1;            // eventfd to shutdown the threads in epoll
 
+  /**
+   * atomic var Represents the state of the threads & connections
+   */
   struct Threads_state {
-    // atmoic var Represents the state of the threads & connections
     uint16_t threads = 0;         // threads in Thread_pool
     uint16_t epoll_waiting = 0;   // threads waiting on epoll in Thread_pool
     uint16_t lock_waiting = 0;    // threads waiting on a lock in Thread_pool
@@ -198,11 +200,13 @@ struct Thread_pool {
   typedef chrono::time_point<chrono::steady_clock> time_point;
   typedef chrono::duration<chrono::steady_clock> duration;
   
-  atomic<time_point> *threads_waiting_since;  /* an array of times when more threads */
+  atomic<time_point> *threads_waiting_since;
   atomic<size_t> start_of_threads_waiting_since;
   atomic<bool> timer_set = false;
 
-  /** These are the values returned in epoll_event.data.u64 by epoll_wait. */
+  /**
+   * These are the values returned in epoll_event.data.u64 by epoll_wait.
+   */
   enum {
     EVENT_SHUTDOWN = 0,
     EVENT_TIMER = 1,
@@ -494,12 +498,12 @@ bool Thread_pool::has_thread_timed_out() {
     }
 
     if (state.epoll_waiting > min_waiting_threads_per_pool) {
-      atomic<time_point> &since = threads_waiting_since[
-                                      start_of_threads_waiting_since];
+      time_point since = threads_waiting_since[start_of_threads_waiting_since];
       time_point now = clock::now();
       auto msecs = chrono::milliseconds{keep_excess_threads_alive_ms};
-      if (now - since.load() > msecs) {
-        // we've had threads waiting without work for n msecs. die.
+      if (now - since > msecs) {
+        // we've had > min_waiting_threads_per_pool waiting without work for
+        // keep_excess_threads_alive_ms. die.
         state.threads--;
         state.epoll_waiting--;
         return_val = true;
