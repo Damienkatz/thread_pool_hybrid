@@ -176,7 +176,7 @@ struct Thread_pool {
   int new_ci_pipe_write = -1;     // epoll_wait(...) to communicate a new
                                   // connection to the thread pool
 
-  int timerfd = -1;               // Used to kill off excess threads at interval
+  int timerfd = -1;               // timeout timer to kill off excess threads
 
   int evfd_poll = -1;             // eventfd to shutdown the threads in poll 
                                   //  or convert them to epoll
@@ -184,7 +184,8 @@ struct Thread_pool {
   int evfd_epoll = -1;            // eventfd to shutdown the threads in epoll
 
   /**
-   * atomic var Represents the state of the threads & connections
+   * threads_state is atomic var represents the state of the threads &
+   * connections in the thread pool.
    */
   struct Threads_state {
     uint16_t threads = 0;         // threads in Thread_pool
@@ -199,9 +200,43 @@ struct Thread_pool {
   typedef chrono::steady_clock clock;
   typedef chrono::time_point<chrono::steady_clock> time_point;
   typedef chrono::duration<chrono::steady_clock> duration;
-  
+
+  /**
+   * Variable `threads_waiting_since` is a circular array of beginning wait
+   * times of length `max_threads_per_pool - min_waiting_threads_per_pool` and
+   * the variable `first_waiting_since` is when the first thread N that is
+   * greater than `min_waiting_threads_per_pool` started waiting.
+   * `first_waiting_since + 1 % length` is the second.
+   * `first_waiting_since + 2 % length` is the third.
+   *  ...etc...
+   *
+   * The threads are waiting on epoll_wait, and the Nth above
+   * `min_waiting_threads_per_pool` about to be waiting thread marks
+   * `first_waiting_since + N % length` with the aproximate time it starts
+   * waiting.
+   *
+   * Before the first thread (`min_waiting_threads_per_pool + 1`) starts
+   * waiting, it sets `timer_set` to true and set `timerfd` to fire at
+   * `keep_excess_threads_alive_ms` in the future.
+   * 
+   * A thread waiting at that time or later will get the event, and if the
+   * total threads waiting is greater than `min_waiting_threads_per_pool` it
+   * will check the time at `first_waiting_since`. If the time at
+   * `first_waiting_since` is more than `keep_excess_threads_alive_ms` in the
+   * past, the thread will perform `++first_waiting_since %= length` and then
+   * die. If there are other threads waiting it will set timerfd` to fire at
+   * the time in the `first_waiting_since` slot at 
+   * `keep_excess_threads_alive_ms` beyond that time.
+   * 
+   * This means when there is no acivity in the thread pool, it uses zero CPU
+   * after the excess threads time out.
+   */
   atomic<time_point> *threads_waiting_since;
-  atomic<size_t> start_of_threads_waiting_since;
+  atomic<size_t> first_waiting_since;
+
+  /**
+   * timer_set is true when timerfd (the thread timeout timer) is set.
+   */
   atomic<bool> timer_set = false;
 
   /**
@@ -221,11 +256,13 @@ struct Thread_pool {
 
   /**
    * Represents the scheduler_data stored in a thd, which is stored as a
-   * void pointer. This allows us to attach state to thd without allocation.
+   * void pointer. The void pointer is never dereferenced it's bits are
+   * copied into and out this struct. This allows us to attach state to thd
+   * without allocation.
    */
   struct thd_scheduler_data {
-    uint16_t offset = 0; // offset into thread_pools that contains thd
-    uint16_t flags = 1;  // flags about the connection. 1 always set so it's
+    uint16_t offset = 0; // Offset into thread_pools array that contains thd.
+    uint16_t flags = 1;  // Flags about the connection. 1 always set so it's
                          // distiguishable from a null ptr when offset is 0
                          // and no flags
     enum {
@@ -237,12 +274,14 @@ struct Thread_pool {
     thd_scheduler_data(uint16_t offset_in) : offset(offset_in) {}
 
     thd_scheduler_data(void *ptr) {
-      if (ptr == nullptr) std::raise(SIGABRT);
+      if (ptr == nullptr) std::raise(SIGABRT); //SHOULD NOT HAPPEN
       memcpy(this, &ptr, sizeof(ptr));
     }
+  
     Thread_pool *tp() {
       return &thread_pools[offset];
     }
+  
     void *to_ptr() {
       void *v;
       memcpy(&v, this, sizeof(thd_scheduler_data));
@@ -316,7 +355,7 @@ Thread_pool::~Thread_pool() {
 int Thread_pool::initialize() {
   size_t n = max_threads_per_pool - min_waiting_threads_per_pool;
   threads_waiting_since = new atomic<time_point>[n];
-  start_of_threads_waiting_since = n;
+  first_waiting_since = 0;
 
   if ((epfd = epoll_create1(EPOLL_CLOEXEC)) == -1)
     return errno;
@@ -433,10 +472,14 @@ void Thread_pool::incr_epoll_waiting_and_record_wait_start_and_maybe_set_timer()
 
   if (state.epoll_waiting <= max_threads_per_pool &&
       state.epoll_waiting > min_waiting_threads_per_pool) {
-    // mark our slot current time
+    // mark our slot current time. If we are `epoll_waiting + 1 =
+    // min_waiting_threads_per_pool` (the first thread) N is zero.
     size_t n = state.epoll_waiting - min_waiting_threads_per_pool - 1;
-    n = (n + start_of_threads_waiting_since) %
-          (max_threads_per_pool - min_waiting_threads_per_pool);
+    size_t first;
+    do {
+      first = first_waiting_since;
+      n = (n + first) % (max_threads_per_pool - min_waiting_threads_per_pool);
+    } while(first != first_waiting_since);
 
     threads_waiting_since[n].store(clock::now());
     
@@ -478,6 +521,10 @@ bool Thread_pool::has_thread_timed_out() {
     return false;
   }
   debug_out(this, "Checking has_thread_timed_out()");
+
+  // now mark the timer as off so another thread can turn it on.
+  timer_set.store(false);
+
   bool return_val;
   // see if we've been waiting (as a group) for too long.
   Threads_state state_old, state;
@@ -492,13 +539,12 @@ bool Thread_pool::has_thread_timed_out() {
       state.epoll_waiting--;
       return_val = true;
 
-      debug_out(this, "thread has decided to die because above"
-                      " max_threads_per_pool");
+      debug_out(this, "thread to die because above max_threads_per_pool");
       continue;
     }
 
     if (state.epoll_waiting > min_waiting_threads_per_pool) {
-      time_point since = threads_waiting_since[start_of_threads_waiting_since];
+      time_point since = threads_waiting_since[first_waiting_since];
       time_point now = clock::now();
       auto msecs = chrono::milliseconds{keep_excess_threads_alive_ms};
       if (now - since > msecs) {
@@ -508,7 +554,7 @@ bool Thread_pool::has_thread_timed_out() {
         state.epoll_waiting--;
         return_val = true;
 
-        debug_out(this, "thread has decided to die because without work for"
+        debug_out(this, "thread to die because without work for"
                         " keep_excess_threads_alive_ms");
       }
     }
@@ -517,22 +563,22 @@ bool Thread_pool::has_thread_timed_out() {
   if (return_val)
     debug_out(this, "thread has confirmed going to die");
 
-  size_t start_old, start = start_of_threads_waiting_since;
+  size_t first_old, first = first_waiting_since;
   if (return_val) {
-    // we should die. compute the new start slot
+    // we should die. compute the new first slot
     do {
-      start_old = start = start_of_threads_waiting_since;
-      start++;
-      if (start > max_threads_per_pool - min_waiting_threads_per_pool)
-        start = 0;
-    } while (!start_of_threads_waiting_since
-                .compare_exchange_weak(start_old, start)); 
+      first_old = first = first_waiting_since;
+      ++first %= max_threads_per_pool - min_waiting_threads_per_pool;
+    } while (!first_waiting_since.compare_exchange_weak(first_old, first));
   }
   
-  if (state.epoll_waiting > min_waiting_threads_per_pool) {
-    // using start slot time, add the keep_excess_threads_alive_ms to the timer
-    auto next_time_out = threads_waiting_since[start].load().time_since_epoch();
-    long nsecs = chrono::duration_cast<chrono::nanoseconds>(next_time_out).count() +
+  if (state.epoll_waiting > min_waiting_threads_per_pool &&
+      !timer_set.exchange(true)) {
+    // another thread didn't turn the timer on, so we do.
+    // using start slot time, add keep_excess_threads_alive_ms to the 
+    // time and set it to the timer
+    auto time = threads_waiting_since[first].load().time_since_epoch();
+    long nsecs = chrono::duration_cast<chrono::nanoseconds>(time).count() +
                  keep_excess_threads_alive_ms * 1000000;
 
     time_t secs = (nsecs / 1000000000);
@@ -548,11 +594,6 @@ bool Thread_pool::has_thread_timed_out() {
         "timerfd_settimet() returned %d", errno);
       std::raise(SIGABRT);
     }
-  } else {
-    // no other thread waiting, set timer off
-    // While it's possible other threads are waiting because we are racing them, the next
-    // thread to wait sets timerfd_settime and turns the timer_set to true.
-    timer_set.store(false);
   }
   return return_val;
 }
