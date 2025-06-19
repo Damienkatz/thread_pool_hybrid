@@ -640,7 +640,7 @@ THD* Thread_pool::get_channel_info_and_turn_into_thd() {
   // this means it's a new connection. Extract the Channel_info ptr
   // and turn it into a THD ptr
   Channel_info *ci;
-  if (read(new_ci_pipe_read, &ci, sizeof(ci)) == 0) {
+  if (read(new_ci_pipe_read, &ci, sizeof(ci)) != sizeof(ci)) {
     // We hit this path when another thread was awoken and processed this event
     // before we could get to it.
     debug_out(this, "Got empty notification from new_ci_pipe_read");
