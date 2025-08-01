@@ -1,7 +1,7 @@
 # thread_pool_hybrid
 MySQL thread pool hybrid (poll/epoll) client connection handler.
 
-Faster and more scalable than both the default MySQL Community Edition connection per thread handler ([see benchmarks](https://github.com/Damienkatz/thread_pool_hybrid_benchmark/blob/main/thread_pool_hybrid-vs-connection_per_thread-mysql_8.0.4-ubuntu_24.04-on-r5.8xlarge.md)) and the MySQL Enterprise Edition thread pool handler ([see benchmarks](https://github.com/Damienkatz/thread_pool_hybrid_benchmark/blob/main/thread_pool_hybrid_vs_enterprise_thread_pool-mysql-9.0.3-redhat_9.0.4-r7i.4xlarge.md)).
+Faster and more scalable than the default MySQL Community Edition connection per thread handler ([see benchmarks](https://github.com/Damienkatz/thread_pool_hybrid_benchmark/blob/main/thread_pool_hybrid-vs-connection_per_thread-mysql_8.0.4-ubuntu_24.04-on-r5.8xlarge.md)) and any other enterprisey connection handler (Oracle doesn't allow publishing of competitive benchmarks against their closed source stuff).
 
 Allows much higher client counts without a drop in throughput vs the closed source "thread pool" handler while keeping the low latency performance of open source "connection per thread" handler, when the client count is low. When the count of clients gets very high and therefore threads, becomes too high the cost of too frequent context switching starts to dominate the CPU and memory bus. And adding more clients makes the time spent context switching greater and greater, and means there is less time available to do actual work.
 
