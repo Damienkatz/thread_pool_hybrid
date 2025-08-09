@@ -59,7 +59,7 @@ static unsigned int max_threads_per_pool = 1;
 static MYSQL_SYSVAR_UINT(
   max_threads_per_pool, max_threads_per_pool,
   PLUGIN_VAR_READONLY | PLUGIN_VAR_OPCMDARG,
-  "Maximum threads per pool. Can grow to larger than this.",
+  "Maximum threads per pool. Can grow to be larger than this under some circumstances.",
   NULL, NULL, 16, 2, 0xFFFF, 0);
 
 static unsigned int min_waiting_threads_per_pool = 4;

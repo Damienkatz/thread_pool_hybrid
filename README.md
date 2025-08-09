@@ -1,15 +1,35 @@
 # thread_pool_hybrid
-MySQL thread pool hybrid (poll/epoll) client connection handler.
+Thread pool hybrid (poll/epoll) for MySQL client connection handler.
 
-Faster and more scalable than the default MySQL Community Edition connection per thread handler ([see benchmarks](https://github.com/Damienkatz/thread_pool_hybrid_benchmark/blob/main/thread_pool_hybrid-vs-connection_per_thread-mysql_8.0.4-ubuntu_24.04-on-r5.8xlarge.md)) and any other enterprisey connection handler (Oracle doesn't allow publishing of competitive benchmarks against their closed source stuff).
+The **thread_pool_hybrid** plugin provides a high-performance, scalable alternative to MySQL’s default connection-per-thread handler (Community Edition) and Oracle's closed-source “enterprise” thread pool implementations.
 
-Allows much higher client counts without a drop in throughput vs the closed source "thread pool" handler while keeping the low latency performance of open source "connection per thread" handler, when the client count is low. When the count of clients gets very high and therefore threads, becomes too high the cost of too frequent context switching starts to dominate the CPU and memory bus. And adding more clients makes the time spent context switching greater and greater, and means there is less time available to do actual work.
+It is **faster** and **more scalable** than both, while preserving low-latency performance at low connection counts.
 
-So before that can happen, thread_pool_hybrid has each thread waiting on a single client socket and a shared eventfd in `poll(...)`. When reaching the maximum number of threads it gets a notification through the eventfd and switches to calling `epoll_wait(...)`. And now instead of getting messages from a single client socket, a thread can get them from any open client socket added to the thread pool epoll instance. When this happens each thread in the pool was either processing a request or waiting on `poll(...)`. And threads waiting on `poll(...)` will get the message, those processing a request will, when they are done processing the current request, will check and see they are supposed to call `epoll_wait(...)`.
+## Why It’s Better
 
-There are, by default, the same number of independent thread pools as there are processors available to the machine. When a new connection comes in, `add_connection(...)` in the handler is called by MySQL, and it looks to see which is the next thread pool via the global `atomic<size_t> next_thread_pool` variable. It assigns the client socket to it, and then increments the `next_thread_pool` unless it is on the last thread pool, in which case it changes `next_thread_pool` to zero. This helps ensure all thread pools are saturating the CPUs relatively evenly.
+* MySQL’s default connection-per-thread model works well with low client counts 
+(almost as well as this), but as connections rise, thread counts rise proportionally.
+    This causes excessive context switching, saturating the CPU and memory bus, leaving less time for actual query work.
+* Closed-source thread pool handlers mitigate context switching but often add latency, especially when client counts are low.
+* Why is it faster and more scalable than Oracle's "enterprise" version?
+    I don't know, but the person who wrote the first version of it was **me**, in 2006. And it's changed a lot since then. And I'm a much better coder now. And Oracle's version likely uses **libev** which brings in cross-platform bloat.
 
-# Usage
+**thread_pool_hybrid** delivers the best of both worlds:
+
+* Low-latency connection-per-thread performance at low client counts.
+* Automatic switch to epoll-based multiplexing at high client counts, preventing throughput collapse.
+
+## How It Works
+
+1. Connection-Per-Thread Mode (Low Connections)
+    Each thread handles exactly one client socket, waiting in poll(...) alongside a shared eventfd.
+2. Automatic Epoll Mode (High Connections)
+    When thread count hits the configured maximum:
+    * The eventfd signals threads to switch from poll(...) to epoll_wait(...).
+    * Threads in epoll mode can serve requests from any socket in the pool, not just one.
+3. Load Balancing Across Thread Pools
+    * By default, the number of independent thread pools = number of available CPUs or vCPUs.
+    * New connections are assigned in round-robin order using a global atomic counter.
 
 ## Building and Installing
 
@@ -30,7 +50,7 @@ You uninstall like this:
 
     mysql> UNINSTALL PLUGIN THREAD_POOL_HYBRID;
 
-However it will uninstall the library and then ***crash the server!*** This is because uninstalling this way removes the thread_pool_hybrid code from the running server, but that same code is currently serving the client request. So it crashes, having the code it is in the middle of running, *disappear*.
+However it will uninstall the library and then ***crash the server!*** This is because uninstalling this way removes the thread_pool_hybrid code from the running server, but that same code is currently serving the uninstall client request. So it crashes, having the code it is in the middle of running, *disappear*.
 
 Or you can install by adding this to a config file (often in `/etc/my.cnf`):
 
@@ -91,7 +111,7 @@ Maximum number of the threads per pool. Though the total count can grow larger t
 
 Until the thread counts reaches maximum, the minimum threads waiting in epoll_wait. This is so if there is a sudden surge in connections the server can keep up by using threads in reserve.
 
-### thread_pool_hybrid_min_waiting_threads_per_pool
+### thread_pool_hybrid_keep_excess_threads_alive_ms
 
 | Description | Value |
 | --- | --- |
@@ -110,7 +130,7 @@ How long extra threads -- above thread_pool_hybrid_min_waiting_threads_per_pool 
 | Description | Value |
 | --- | --- |
 | **Command-Line Format** | --thread_pool_hybrid_enable_connection_per_thread_mode=ON/OFF |
-| **System Variable** | thread_pool_hybrid_keep_excess_threads_alive_ms==ON/OFF |
+| **System Variable** | thread_pool_hybrid_enable_connection_per_thread_mode==ON/OFF |
 | **Dynamic** | Yes |
 | **Type** | Boolean |
 | **Default Value** | ON |
@@ -127,7 +147,7 @@ Enables or disables connection-per-thread mode until the connection count is gre
 | **Type** | String |
 | **Default Value** | "" |
 
-When set to file that the MySQL process has write access to, will append a bunch of debugging messages to the file as it works. This is dynamic and can be turned on like this:
+When set to a file that the MySQL process has write access to, will append a bunch of debugging messages to the file as it works. This is dynamic and can be turned on like this:
 
     MySQL> SET GLOBAL thread_pool_hybrid_debug_out_file = "/home/me/foo.txt";
 
