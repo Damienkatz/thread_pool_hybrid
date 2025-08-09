@@ -105,7 +105,7 @@ Maximum number of the threads per pool. Though the total count can grow larger t
 | **System Variable** | thread_pool_hybrid_min_waiting_threads_per_pool=# |
 | **Dynamic** | No |
 | **Type** | Integer |
-| **Default Value** | 4 |
+| **Default Value** | 2 |
 | **Minimum Value** | 1 |
 | **Maximum Value** | 65,535 |
 

@@ -62,14 +62,14 @@ static MYSQL_SYSVAR_UINT(
   "Maximum threads per pool. Can grow to be larger than this under some circumstances.",
   NULL, NULL, 16, 2, 0xFFFF, 0);
 
-static unsigned int min_waiting_threads_per_pool = 4;
+static unsigned int min_waiting_threads_per_pool = 2;
 
 static MYSQL_SYSVAR_UINT(
   min_waiting_threads_per_pool, min_waiting_threads_per_pool,
   PLUGIN_VAR_READONLY | PLUGIN_VAR_OPCMDARG,
   "Minimum threads waiting for client io per pool. "
   "Must be at least 1 less than thread_pool_hybrid_total_thread_pools.",
-  NULL, NULL, 4, 1, 0xFFFF, 0);
+  NULL, NULL, 2, 1, 0xFFFF, 0);
 
 
 static uint64_t keep_excess_threads_alive_ms = 0;
